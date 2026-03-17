@@ -1,0 +1,161 @@
+[Claw]
+# 插件总开关：true 启用 / false 禁用
+enable = true
+# 命令前缀：用于手动命令（例如 /claw status）
+commands = ["/claw", "claw"]
+
+# OpenClaw Gateway WebSocket 地址（必填；为空时插件会自动禁用，避免误连）
+ws-url = "ws://:18789"
+# 网关共享认证（二选一即可）
+# gateway-token：推荐方式
+gateway-token = ""
+# gateway-password：兼容旧配置
+gateway-password = ""
+# 设备令牌（可选，不填则不带）
+device-token = ""
+
+# 是否插件启动后自动建立 WS 连接
+auto-connect = true
+# 断线后是否自动重连
+auto-reconnect = true
+# 握手连接超时（秒）
+connect-timeout-seconds = 12
+# 普通 RPC 请求超时（秒）
+request-timeout-seconds = 20
+# 等待 connect.challenge 的超时（秒）
+challenge-timeout-seconds = 2
+
+# 客户端标识信息（用于 OpenClaw connect.client）
+client-id = "gateway-client"
+client-mode = "backend"
+client-version = "allbot-claw-1.0.0"
+client-platform = "linux"
+client-display-name = "AllBot Claw"
+# 可选：设备族信息，会参与 device-auth payload（留空即可）
+client-device-family = ""
+
+# 网关角色与权限声明（operator 场景）
+role = "operator"
+# scopes：默认仅读写 + operator.admin（用于 /model /映射/切换模型 等管理类 RPC）。
+# 若你不需要这些管理能力，可移除 operator.admin 降低权限面。
+scopes = ["operator.read", "operator.write", "operator.admin"]
+# 节点能力声明（operator 一般留空）
+caps = []
+commands-claims = []
+permissions = {}
+
+# 手动命令默认参数（可选）
+default-chat-to = ""
+default-agent-id = ""
+default-channel = ""
+default-account-id = ""
+# 回复最大长度：用于分片发送（避免微信侧静默截断），单条消息内部还会强制 <= 900 字符
+max-reply-chars = 1800
+# 是否将网关流式增量(delta)实时回写到微信
+# false：仅终态一次性发送完整回复（推荐，避免回复不全/丢段）
+# true：开启流式回写（可能产生多条消息，且存在微信侧丢段/乱序风险）
+stream-reply-enable = false
+
+# ===== OpenClaw device-auth（建议开启，否则远端网关可能清空 scopes 导致无权限）=====
+# true：在 connect 时携带 Ed25519 device identity + challenge 签名，用于绑定 scopes
+device-auth-enable = true
+# device identity 存放目录（默认 plugins/Claw/state），建议持久化
+device-state-dir = ""
+
+# ===== 触发词自动转发模式 =====
+# true：普通消息命中触发词后自动调用 OpenClaw agent
+auto-trigger-enable = true
+# 触发词列表（示例：["龙虾", "你好"]）
+trigger-words = ["龙虾"]
+# 匹配模式：
+# prefix  前缀匹配（推荐，如“龙虾 你好”）
+# contains 包含匹配
+# exact   完全匹配
+trigger-match-mode = "prefix"
+# true：转发时去掉触发词本体（“龙虾 你好” -> “你好”）
+trigger-strip-word = true
+# true：等待最终态（忽略 accepted 中间态）
+# 建议：保持 false，优先走 accepted + WS 实时事件回推，避免大模型耗时导致“触发词 RPC 超时”
+trigger-expect-final = false
+# 触发词调用超时（秒）
+trigger-timeout-seconds = 45
+# 异步等待 WS 实时事件回推的最大保留时长（秒）：超时后清理 pending run
+# 建议至少 600（10 分钟）
+pending-run-ttl-seconds = 600
+# ===== pending run 看门狗（防止“accepted 后无任何事件”导致长期无回复）=====
+# true：当 pending run 长时间无事件/无流式输出时，尝试用 `chat.history` 兜底拉取终态文本；
+# 若仍未取到终态，则继续等待至 `pending-run-ttl-seconds`，最终仅清理 pending-run（不回写“模型超时/重试失败”等提示到微信，避免污染会话）
+pending-run-watchdog-enable = true
+# 多少秒无任何进展视为卡死（建议 45-120）
+pending-run-watchdog-seconds = 60
+# 看门狗检测周期（秒）
+pending-run-watchdog-interval-seconds = 5
+# true：为每个会话生成稳定 sessionKey，保持上下文
+trigger-use-session-key = true
+# sessionKey 前缀（最终形如 agent:<agent>:<prefix>:<hash>）
+trigger-session-prefix = "wechat"
+# 触发词模式固定 agent（空字符串表示使用 OpenClaw 默认）
+trigger-agent-id = ""
+# true：当 trigger-agent-id / default-agent-id 为空时，自动使用网关 health.defaultAgentId
+trigger-auto-default-agent = true
+# 回复前缀（可选，例如 "[Claw] "）
+trigger-reply-prefix = ""
+# true：私聊消息不需要触发词，直接转发到 OpenClaw
+private-auto-forward-enable = true
+# true：当消息以 “/” 开头且不是本插件命令时，视为 OpenClaw 命令，直接调用网关方法并回显结果
+# 注意：仅全局管理员（main_config.toml 的 [XYBot].admins）可用
+# 说明：
+# - `/new`、`/reset`：插件本地切换到新 `sessionKey`（无需 operator.admin，且不会当作普通文本转发到 agent）
+# - 其他 `/xxx`：按网关 RPC method 调用并回显结果（失败也不会回退成 agent 文本转发）
+slash-command-forward-enable = true
+# true：Claw 处理完成后仍允许后续插件继续处理同一条消息（避免阻塞/吞消息）
+propagate-to-other-plugins = true
+# true：发生模型超时/空回复/模型错误重试时，把英文重试提示注入“发给网关”的重试消息体
+# 注意：该提示不会先回复到框架；重试消息不会附带本次对话内容（原 prompt），由网关基于同 sessionKey 上下文自行重试
+retry-hint-to-gateway-enable = true
+# ===== 去重（防止框架重复触发导致二次请求）=====
+# true：开启短窗去重（按 MsgId 去重）
+dedup-enable = true
+# 去重窗口（秒），建议 2-5
+dedup-window-seconds = 3
+# 命令列表关键词：命中任一关键词时，直接回复 OpenClaw 方法列表与示例（需已 /claw connect 获取过方法列表）
+# 注意：仅全局管理员（main_config.toml 的 [XYBot].admins）可用
+method-help-keywords = ["openclaw命令", "claw命令", "龙虾命令", "命令列表"]
+# true：群聊 @机器人 时不需要触发词，直接转发到 OpenClaw
+at-auto-forward-enable = true
+# true：图片消息直接转发到 OpenClaw（无需触发词）
+# 注意：群聊图片不会“直接转发”，仅在引用图片的消息命中触发词或 @机器人 时才会把图片信息附带给网关
+image-auto-forward-enable = true
+# 图片转发模式：
+# summary 仅转发图片摘要（md5/path/大小，推荐）
+# base64  携带截断后的 base64 内容（体积较大）
+# path 仅发送图片文件路径（当网关可访问宿主机路径时推荐）
+image-forward-mode = "path"
+# 当 image-forward-mode=base64 时生效：
+# 0 表示不截断（直接发送完整 base64，体积可能很大）
+image-base64-max-chars = 0
+# 当 base64 不可用时，是否附带图片路径给网关
+image-path-forward-enable = true
+# 将容器内 /app 映射到宿主机路径，便于网关读取本地图片
+image-host-path-prefix = "/home/sxkiss/桌面/bot/xbot"
+# 可选：对外可访问的媒体基础地址（建议填能被网关访问的地址）
+# 已按当前部署填写，生成形如 http://l.sxkiss.top:9090/media/files/<filename> 的链接
+image-public-base-url = "http://l.sxkiss.top:9090"
+# 对外媒体访问路由前缀（默认 /media/files）
+image-public-route-prefix = "/media/files"
+# true：引用消息转发时附带被引用内容上下文
+quote-include-enable = true
+
+# ===== 链接文章（appmsg type=5）=====
+# 私聊：收到链接文章会解析 title/url 并直接转发到 OpenClaw
+# 群聊：收到链接文章不会直接转发，需在“引用该文章”的消息中命中触发词或 @机器人 才会附带给网关
+
+[Claw.EventForward]
+# 事件主动转发开关（与触发词流程独立）
+enable = true
+# 允许转发的事件白名单（空则不过滤）
+allowed-events = ["agent", "chat", "health", "shutdown", "node.pair.requested", "device.pair.requested"]
+# 固定转发目标 wxid 列表（可留空）
+to-wxids = []
+# 群里转发时是否优先 @触发人
+mention-in-group = true
