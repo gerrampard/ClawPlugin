@@ -9,7 +9,7 @@
 - 管理员 slash 直通：私聊可直接发送 `/命令`；群聊需 `@机器人 + 唤醒词 + /命令`，真实网关 RPC method 走 RPC，`/new`、`/reset`、`/model`、`/think` 等 OpenClaw 原生命令走 `agent`
 - `龙虾 帮助` / `龙虾 命令` 本地返回常用命令和功能说明
 - 支持图片、语音、视频、文件、引用消息、链接文章上下文附带
-- 图片、语音、视频、文件消息统一优先走网关原生 WS `attachments`；若微信侧已把媒体下载到内存，插件会直接转成 base64 附件；若只有本地文件，插件会读取后转成附件发给网关，不再把 `MEDIA:<path>` 或 `http://...` 发给网关
+- 仅图片消息优先走网关原生 WS `attachments`；语音、视频、文件改回走公网 `http://...` 链接/本地路径提示，不再作为 WS 附件发送给网关
 - 支持 `Claw.EventForward` 事件主动转发；仅在显式配置 `to-wxids` 时转发原始网关事件体
 
 ## 核心配置
@@ -60,8 +60,8 @@
 - 同一会话存在 pending run 时会跳过新的重复触发，避免队列堆积和多次回写
 - `accepted` 后会同时等待 WS 事件和 `agent.wait` 兜底，只回写一次终态；`chat` 完成事件如果暂时没有文本，会优先等待 `agent.wait/chat.history` 收敛，不会立刻回打网关重试
 - 图片、语音、视频、文件、链接文章、引用消息会按当前会话上下文附带给网关；群聊通常需要触发词、`@机器人` 或引用触发
-- 图片、语音、视频、文件消息都会优先发送网关原生 `attachments`，附件对象同时携带 `content` 和 `source: { type: "base64", media_type, data }` 两种 base64 表达，兼容 Web UI / dashboard 上传格式
-- 文件/语音/视频在缺少现成本地路径时，会复用微信框架已下载好的内存 payload 落盘到 `files/claw-media/`，再从落盘文件读取并转成 WS 附件
+- 图片消息会优先发送网关原生 `attachments`，附件对象同时携带 `content` 和 `source: { type: "base64", media_type, data }` 两种 base64 表达，兼容 Web UI / dashboard 上传格式
+- 语音/视频/文件只会在 prompt 中附带公网 `http://...` 链接；不会再向网关透传本地路径或 `MEDIA:` 指令；缺少现成本地路径时仍会复用微信框架已下载好的内存 payload 落盘到 `files/claw-media/`
 - 群聊中的 slash 文本不会直接发往网关；只有管理员同时满足 `@机器人 + 唤醒词 + /命令` 才会执行
 - 插件不会下载或回传网关附件；仅对微信侧已经拿到的非图片入站媒体 payload 做本地落盘，供网关读取
 - `401/未授权/权限不足/账号停用/配额不足` 一类硬错误不会自动重试，也不会再向网关发送 `[Gateway Retry Notice]`

@@ -97,7 +97,7 @@ image-path-forward-enable = true
 # 容器内 `/app` 映射到宿主机路径，便于网关读取本地图片
 image-host-path-prefix = "/home/sxkiss/桌面/bot/xbot"
 # 可选公网媒体地址，最终生成 `<base><prefix>/<filename>`
-image-public-base-url = "http://l.sxkiss.top:9090"
+image-public-base-url = "http://127.0.0.1:9090"
 image-public-route-prefix = "/media/files"
 # 引用消息附带被引用内容上下文
 quote-include-enable = true

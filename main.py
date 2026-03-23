@@ -4227,11 +4227,19 @@ class ClawPlugin(PluginBase):
             return f"{identity_header}\n{image_payload}".strip() if identity_header else image_payload
         if msg_type in {34, 43}:
             media_label = "语音" if msg_type == 34 else "视频"
-            media_payload = self._format_binary_media_attachment_prompt(message, media_label=media_label)
+            media_payload = (
+                self._format_binary_media_attachment_prompt(message, media_label=media_label)
+                if use_gateway_attachments
+                else self._format_binary_media_prompt(message, media_label=media_label)
+            )
             return f"{identity_header}\n{media_payload}".strip() if identity_header else media_payload
         prompt = user_text.strip()
         if msg_type == 49:
-            file_prompt = self._format_file_attachment_prompt(message)
+            file_prompt = (
+                self._format_file_attachment_prompt(message)
+                if use_gateway_attachments
+                else self._format_file_prompt(message)
+            )
             if file_prompt:
                 prompt = f"{prompt}\n\n{file_prompt}".strip() if prompt else file_prompt
                 return f"{identity_header}\n{prompt}".strip() if identity_header else prompt
@@ -4481,12 +4489,6 @@ class ClawPlugin(PluginBase):
             mime_type = self._guess_image_attachment_mime_type(message, payload)
             file_name = self._guess_image_attachment_file_name(message, mime_type)
             return [self._build_gateway_attachment(type_name="image", mime_type=mime_type, file_name=file_name, payload=payload)]
-        if msg_type == 34:
-            return self._build_binary_gateway_attachments(message, media_type="audio")
-        if msg_type == 43:
-            return self._build_binary_gateway_attachments(message, media_type="video")
-        if msg_type == 49:
-            return self._build_binary_gateway_attachments(message, media_type="file")
         return []
 
     def _build_binary_gateway_attachments(self, message: dict, *, media_type: str) -> list[dict[str, Any]]:
@@ -4805,21 +4807,18 @@ class ClawPlugin(PluginBase):
         if not file_name and local_path:
             file_name = os.path.basename(local_path)
         md5_value = _safe_text(message.get("md5") or message.get("ImageMD5")).strip().lower()
-        gateway_path = self._map_path_for_gateway(local_path) if local_path else ""
-        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
+        public_url = self._build_public_media_url(local_path, md5_value=md5_value, file_name=file_name)
         parts = [f"[{media_label}] 已接收"]
         if file_name:
             parts.append(file_name)
         if md5_value:
             parts.append(f"md5={md5_value}")
-        if gateway_path:
-            parts.append(f"path={gateway_path}")
+        if public_url:
+            parts.append(f"url={public_url}")
 
         blocks = [" ".join(parts).strip()]
-        if media_directive:
-            blocks.append(media_directive)
-        if gateway_path:
-            blocks.append(f"[{media_label}路径] {gateway_path}")
+        if public_url:
+            blocks.append(f"[{media_label}链接] {public_url}")
         return "\n\n".join(blocks).strip()
 
     def _format_binary_media_attachment_prompt(self, message: dict, *, media_label: str) -> str:
@@ -4854,8 +4853,7 @@ class ClawPlugin(PluginBase):
         if not (file_name or local_path or md5_value):
             return ""
 
-        gateway_path = self._map_path_for_gateway(local_path) if local_path else ""
-        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
+        public_url = self._build_public_media_url(local_path, md5_value=md5_value, file_name=file_name)
         parts = ["[文件] 已接收"]
         if file_name:
             parts.append(file_name)
@@ -4863,14 +4861,12 @@ class ClawPlugin(PluginBase):
             parts.append(f"size={file_size}")
         if md5_value:
             parts.append(f"md5={md5_value}")
-        if gateway_path:
-            parts.append(f"path={gateway_path}")
+        if public_url:
+            parts.append(f"url={public_url}")
 
         blocks = [" ".join(parts).strip()]
-        if media_directive:
-            blocks.append(media_directive)
-        if gateway_path:
-            blocks.append(f"[文件路径] {gateway_path}")
+        if public_url:
+            blocks.append(f"[文件链接] {public_url}")
         return "\n\n".join(blocks).strip()
 
     def _format_file_attachment_prompt(self, message: dict) -> str:
