@@ -3,9 +3,9 @@
 enable = true
 
 # OpenClaw Gateway WebSocket 地址
-ws-url = "ws://"
+ws-url = "ws://127.0.0.1:18789"
 # 网关共享鉴权（二选一）
-gateway-token = ""
+gateway-token = "00000"
 gateway-password = ""
 # 设备令牌（可选）
 device-token = ""
@@ -93,10 +93,7 @@ image-auto-forward-enable = true
 image-forward-mode = "path"
 # `base64` 模式下生效；0 表示不截断
 image-base64-max-chars = 0
-image-path-forward-enable = true
-# 容器内 `/app` 映射到宿主机路径，便于网关读取本地图片
-image-host-path-prefix = "/home/sxkiss/桌面/bot/xbot"
-# 可选公网媒体地址，最终生成 `<base><prefix>/<filename>`
+# 可选公网媒体地址，最终生成 `<base><prefix>/<filename>`；当前图片 prompt 与引用媒体兜底都使用它
 image-public-base-url = "http://127.0.0.1:9090"
 image-public-route-prefix = "/media/files"
 # 引用消息附带被引用内容上下文

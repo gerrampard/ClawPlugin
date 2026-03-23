@@ -1,7 +1,7 @@
 """
 @input: websockets、asyncio、tomllib、WechatAPIClient、PluginBase 与装饰器；base64/xml 解析用于图片/链接文章与引用上下文；OpenClaw 斜杠命令直通与方法速查；微信路由信息到 OpenClaw `to/groupId/accountId/sessionKey` 的结构化透传，以及通过 `channels.status` 发现网关当前真实支持的消息渠道
-@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/语音/视频/文件/引用消息转发；向网关透传会话/发送者标识；`sessionKey` 保持微信桥接所需的 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态，并仅在渠道已被当前 OpenClaw 版本识别时附带 `agent.channel/replyChannel`；握手时默认声明 `tool-events` 能力以接收实时工具事件；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；管理员 slash 中“真实网关方法”走 RPC，“OpenClaw 原生命令”走 `agent` 并复用当前 sessionKey；当未配置固定 `to-wxids` 时，仅把带 `runId/sessionKey` 的网关事件回推到对应微信会话；唤醒词帮助在本地列出常用命令与功能；图片/语音/视频/文件消息统一优先走网关原生 WS `attachments`（base64 + mimeType + fileName），不再向网关注入本地路径 `MEDIA:<path>` 指令；显式错误只在可恢复场景自动重试，`chat` 无文本终态优先等待兜底收敛，401/权限/账号停用等硬错误不再回打网关；不自动下载或回传网关附件
-@position: plugins/Claw 的核心实现文件，负责消息路由、OpenClaw 会话命名、媒体附件/指令封装、入站媒体落盘与网关通信编排
+@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/语音/视频/文件/引用消息转发；向网关透传会话/发送者标识；`sessionKey` 保持微信桥接所需的 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态，并仅在渠道已被当前 OpenClaw 版本识别时附带 `agent.channel/replyChannel`；握手时默认声明 `tool-events` 能力以接收实时工具事件；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；自动触发链路里的本地等待超时只记日志、不再向微信误报“模型超时”；流式回写后终态会在事件文本、累计流文本和 chat.history 完整文本之间选取可覆盖已发送前缀的最长版本，只补发未发送尾段，不再整段重复回写；图片相关 prompt/引用里的 `MEDIA:` 指令优先使用公网 URL，不再把宿主机本地路径暴露给网关；管理员 slash 中“真实网关方法”走 RPC，“OpenClaw 原生命令”走 `agent` 并复用当前 sessionKey；当未配置固定 `to-wxids` 时，仅把带 `runId/sessionKey` 的网关事件回推到对应微信会话；唤醒词帮助在本地列出常用命令与功能；当前消息图片和可解析的引用图片都会走网关原生 WS `attachments`，语音/视频/文件仅拼公网 `http://...` 链接；文件元数据可从 `appmsg type=6` XML 兜底提取；发往网关前会记录结构化请求摘要用于核对最终 `message/attachments`
+@position: plugins/Claw 的核心实现文件，负责消息路由、OpenClaw 会话命名、媒体附件/提示词封装、入站媒体落盘、文件 XML 元数据兜底与网关通信编排
 @auto-doc: Update header and folder INDEX.md when this file changes
 """
 
@@ -15,6 +15,7 @@ import os
 import glob
 import platform
 import re
+import shutil
 import time
 import subprocess
 import tempfile
@@ -969,8 +970,6 @@ class ClawPlugin(PluginBase):
         )
         self.image_forward_mode = _safe_text(plugin_config.get("image-forward-mode")).strip().lower() or "summary"
         self.image_base64_max_chars = int(plugin_config.get("image-base64-max-chars", 12000))
-        self.image_path_forward_enable = bool(plugin_config.get("image-path-forward-enable", True))
-        self.image_host_path_prefix = _safe_text(plugin_config.get("image-host-path-prefix")).strip()
         self.image_public_base_url = _safe_text(plugin_config.get("image-public-base-url")).strip().rstrip("/")
         self.image_public_route_prefix = _safe_text(plugin_config.get("image-public-route-prefix")).strip() or "/files"
         if not self.image_public_route_prefix.startswith("/"):
@@ -1198,13 +1197,13 @@ class ClawPlugin(PluginBase):
     async def handle_at(self, bot: WechatAPIClient, message: dict):
         if self._should_skip_duplicate("at_message", message):
             return bool(self.propagate_to_other_plugins)
-        if await self._maybe_handle_slash_command(bot, message, strip_at_prefix=True):
+        if await self._maybe_handle_slash_command(bot, message, strip_at_prefix=False):
             return bool(self.propagate_to_other_plugins)
         return await self._handle_trigger(
             bot,
             message,
             bypass_trigger=self.at_auto_forward_enable,
-            strip_at_prefix=True,
+            strip_at_prefix=False,
         )
 
     @on_quote_message(priority=45)
@@ -1273,6 +1272,24 @@ class ClawPlugin(PluginBase):
             return True
 
         user_text = self._extract_user_text(message, strip_at_prefix=strip_at_prefix)
+        if message.get("Ats"):
+            logger.info(
+                "[Claw] AT 消息提取: {}",
+                _compact_json(
+                    {
+                        "msgId": _safe_text(message.get("MsgId")).strip(),
+                        "fromWxid": _safe_text(message.get("FromWxid")).strip(),
+                        "senderWxid": _safe_text(message.get("SenderWxid") or message.get("ActualUserWxid")).strip(),
+                        "content": _safe_text(message.get("Content")).strip(),
+                        "originalContent": _safe_text(message.get("OriginalContent")).strip(),
+                        "pushContent": _safe_text(message.get("PushContent")).strip(),
+                        "ats": message.get("Ats"),
+                        "stripAtPrefix": strip_at_prefix,
+                        "userText": user_text,
+                    },
+                    1200,
+                ),
+            )
         if route.is_group and self._looks_like_group_slash_text(user_text):
             return True
         match = self._match_trigger(user_text) if user_text else None
@@ -1386,10 +1403,10 @@ class ClawPlugin(PluginBase):
         async with lock:
             if int(message.get("MsgType") or 0) == 3 and self.image_forward_mode == "base64":
                 await self._ensure_image_base64(bot, message)
-            attachments = self._build_gateway_attachments(message)
+            attachments, attachment_meta = self._build_gateway_attachments(message)
             if not attachments:
                 await self._ensure_media_local_path(message)
-                attachments = self._build_gateway_attachments(message)
+                attachments, attachment_meta = self._build_gateway_attachments(message)
 
             prompt_text = self._strip_trigger_prompt(user_text, match_word)
             if match_word and (not prompt_text or self._is_method_help_query(prompt_text)):
@@ -1400,6 +1417,7 @@ class ClawPlugin(PluginBase):
                 message,
                 user_text=prompt_text,
                 use_gateway_attachments=bool(attachments),
+                quoted_image_as_attachment=bool(attachment_meta.get("quoted_image")),
             )
             if not prompt:
                 return
@@ -1408,8 +1426,11 @@ class ClawPlugin(PluginBase):
                 reply_text = await self._forward_to_openclaw(prompt, route, attachments=attachments)
             except Exception as exc:
                 if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-                    logger.warning("[Claw] OpenClaw 请求超时")
-                    await self._send_to_route(route, "OpenClaw gateway timeout, please retry.")
+                    logger.warning(
+                        "[Claw] OpenClaw 请求超时，抑制向微信回写超时提示 route_id={} to_wxid={}",
+                        route.route_id,
+                        route.to_wxid,
+                    )
                 else:
                     logger.exception("[Claw] 触发词转发失败")
                     await self._send_to_route(route, f"OpenClaw 调用失败: {exc}")
@@ -1835,6 +1856,34 @@ class ClawPlugin(PluginBase):
             params["sessionKey"] = session_key
             self._remember_session_route(session_key, route)
 
+        logger.info(
+            "[Claw] 发往 OpenClaw agent 请求摘要: {}",
+            _compact_json(
+                {
+                    "route_id": route.route_id,
+                    "to_wxid": route.to_wxid,
+                    "is_group": route.is_group,
+                    "sender_wxid": route.sender_wxid,
+                    "agentId": params.get("agentId"),
+                    "sessionKey": params.get("sessionKey"),
+                    "channel": params.get("channel"),
+                    "replyChannel": params.get("replyChannel"),
+                    "message": params.get("message"),
+                    "attachments": [
+                        {
+                            "type": item.get("type"),
+                            "mimeType": item.get("mimeType"),
+                            "fileName": item.get("fileName"),
+                            "base64Chars": len(_safe_text(item.get("content"))),
+                        }
+                        for item in (attachments or [])
+                        if isinstance(item, dict)
+                    ],
+                },
+                2000,
+            ),
+        )
+
         expect_final = bool(self.trigger_expect_final)
         timeout_seconds = max(6, int(self.trigger_timeout_seconds))
 
@@ -2180,22 +2229,12 @@ class ClawPlugin(PluginBase):
             return
         route, _ = pending
 
-        pending_text = self._pending_run_texts.get(run_id, "").strip()
-        wait_text = self._extract_openclaw_reply_text(payload).strip()
-        reply_text = pending_text
-        if wait_text and len(wait_text) > len(reply_text):
-            reply_text = wait_text
-
-        if not reply_text:
-            history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
-            if history_text and len(history_text) > len(reply_text):
-                reply_text = history_text
-
-            if not reply_text:
-                await asyncio.sleep(0.6)
-                history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
-                if history_text:
-                    reply_text = history_text
+        reply_text = await self._resolve_best_final_reply_text(
+            run_id,
+            payload,
+            session_key,
+            prefer_history=True,
+        )
 
         if reply_text:
             failure_kind = self._classify_model_failure_text(reply_text)
@@ -2853,6 +2892,43 @@ class ClawPlugin(PluginBase):
             return ""
         return self._extract_assistant_reply_from_chat_history(payload).strip()
 
+    def _pick_longest_reply_text(self, *texts: Any) -> str:
+        best = ""
+        for text in texts:
+            candidate = _safe_text(text).strip()
+            if candidate and len(candidate) > len(best):
+                best = candidate
+        return best
+
+    async def _resolve_best_final_reply_text(
+        self,
+        run_id: str,
+        payload: Any,
+        session_key: str,
+        *,
+        prefer_history: bool = False,
+    ) -> str:
+        pending_text = _safe_text(self._pending_run_texts.get(run_id, "")).strip()
+        payload_text = self._extract_openclaw_reply_text(payload).strip()
+        sent_text = _safe_text(self._pending_run_stream_sent_texts.get(run_id, "")).strip()
+        best = self._pick_longest_reply_text(payload_text, pending_text)
+
+        should_fetch_history = bool(session_key) and (
+            prefer_history
+            or not best
+            or (sent_text and len(best) <= len(sent_text))
+            or (sent_text and best and not best.startswith(sent_text))
+        )
+        if should_fetch_history:
+            history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
+            best = self._pick_longest_reply_text(best, history_text)
+            if not best:
+                await asyncio.sleep(0.6)
+                history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
+                best = self._pick_longest_reply_text(best, history_text)
+
+        return best
+
     async def _maybe_finalize_run_via_chat_history(
         self,
         run_id: str,
@@ -2911,14 +2987,13 @@ class ClawPlugin(PluginBase):
                 if not self._is_run_completion_event(event_name, payload):
                     return
 
-                # 终态 payload 有时仅携带最后一段 delta（或部分字段），但我们在流式阶段已累计完整文本。
-                # 为避免“只发到第一段/看起来截断”，这里优先使用更长的累计结果。
-                reply_text = self._extract_openclaw_reply_text(payload).strip()
+                reply_text = await self._resolve_best_final_reply_text(
+                    run_id,
+                    payload,
+                    session_key,
+                    prefer_history=bool(self._pending_run_stream_sent_texts.get(run_id, "").strip()),
+                )
                 pending_text = self._pending_run_texts.get(run_id, "").strip()
-                if pending_text and len(pending_text) > len(reply_text):
-                    reply_text = pending_text
-                elif not reply_text:
-                    reply_text = pending_text
                 reply_failure_kind = self._classify_model_failure_text(reply_text) if reply_text else ""
 
                 if self._is_explicit_run_error(event_name, payload):
@@ -3878,18 +3953,9 @@ class ClawPlugin(PluginBase):
         if not final_text:
             return
 
-        meta = self._pending_run_meta.get(run_id) or {}
-        flush_count = int(meta.get("streamFlushCount") or 0)
-        sent_text = self._pending_run_stream_sent_texts.get(run_id, "")
-
-        # 只要流式阶段曾经回写过（哪怕只有 1 次），微信侧就可能出现丢段/乱序，
-        # 为保证最终一致性：终态直接重发完整文本进行“收敛”。
-        if sent_text and flush_count >= 1:
-            await self._send_to_route(route, final_text)
-        else:
-            suffix, _ = self._compute_unsent_stream_suffix(run_id, final_text)
-            if suffix:
-                await self._send_to_route(route, suffix)
+        suffix, _ = self._compute_unsent_stream_suffix(run_id, final_text)
+        if suffix:
+            await self._send_to_route(route, suffix)
         self._pending_run_stream_sent_texts[run_id] = final_text
         self._pending_run_stream_sent_at[run_id] = time.time()
 
@@ -4043,13 +4109,69 @@ class ClawPlugin(PluginBase):
         return ""
 
     def _extract_message_content(self, message: dict) -> str:
-        content = _safe_text(message.get("Content")).replace("\u2005", " ").strip()
+        content = self._select_preferred_message_content(message).replace("\u2005", " ").strip()
         if ":\n" in content and (
             bool(message.get("IsGroup")) or _safe_text(message.get("FromWxid")).endswith("@chatroom")
         ):
             _, content = content.split(":\n", 1)
             content = content.strip()
         return content
+
+    def _select_preferred_message_content(self, message: dict) -> str:
+        primary = _safe_text(message.get("Content")).strip()
+        if not (message.get("Ats") and (bool(message.get("IsGroup")) or _safe_text(message.get("FromWxid")).endswith("@chatroom"))):
+            return primary
+
+        candidates = [
+            ("OriginalContent", self._normalize_group_at_candidate(_safe_text(message.get("OriginalContent")), message)),
+            ("TextContent", self._normalize_group_at_candidate(_safe_text(message.get("TextContent")), message)),
+            ("Content", self._normalize_group_at_candidate(primary, message)),
+        ]
+        usable = [(name, value) for name, value in candidates if value]
+        if not usable:
+            push_content = self._normalize_group_at_candidate(_safe_text(message.get("PushContent")), message)
+            if push_content:
+                usable = [("PushContent", push_content)]
+        if not usable:
+            return primary
+
+        selected_name, selected_value = max(usable, key=lambda item: len(item[1]))
+        if selected_name != "Content":
+            logger.debug(
+                "[Claw] 群AT内容优先使用 {}，避免已裁剪 Content: msg_id={}",
+                selected_name,
+                _safe_text(message.get("MsgId")).strip() or "-",
+            )
+        return selected_value
+
+    def _normalize_group_at_candidate(self, content: str, message: dict) -> str:
+        text = _safe_text(content).replace("\u2005", " ").strip()
+        if not text:
+            return ""
+
+        for marker in (":\n", " : ", ":"):
+            if marker not in text:
+                continue
+            prefix, rest = text.split(marker, 1)
+            prefix = prefix.strip()
+            rest = rest.strip()
+            if not rest:
+                continue
+            sender_wxid = _safe_text(
+                message.get("SenderWxid") or message.get("ActualUserWxid") or message.get("sender_wxid")
+            ).strip()
+            sender_name = _safe_text(
+                message.get("SenderName") or message.get("sender_name") or message.get("DisplayName")
+            ).strip()
+            push_prefix = _safe_text(message.get("PushContent")).split(marker, 1)[0].strip() if marker in _safe_text(message.get("PushContent")) else ""
+            if prefix and prefix in {sender_wxid, sender_name, push_prefix}:
+                text = rest
+                break
+            if sender_wxid and prefix == sender_wxid:
+                text = rest
+                break
+
+        return self._strip_leading_mentions(text).strip()
 
     def _strip_leading_mentions(self, content: str) -> str:
         text = content.strip()
@@ -4190,6 +4312,61 @@ class ClawPlugin(PluginBase):
         except Exception:
             return {}
 
+    def _extract_file_meta(self, message: dict) -> dict:
+        xml_text = _safe_text(message.get("Content")).strip()
+        if not xml_text or not xml_text.lstrip().startswith("<"):
+            return {}
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(xml_text)
+            appmsg = root.find("appmsg")
+            if appmsg is None:
+                return {}
+            type_element = appmsg.find("type")
+            if type_element is None:
+                return {}
+            if int(type_element.text or "0") != 6:
+                return {}
+            title = _safe_text(appmsg.findtext("title")).strip()
+            attach = appmsg.find("appattach")
+            total_len = _safe_text(attach.findtext("totallen") if attach is not None else "").strip()
+            attach_id = _safe_text(attach.findtext("attachid") if attach is not None else "").strip()
+            file_ext = _safe_text(attach.findtext("fileext") if attach is not None else "").strip().lower()
+            if title and file_ext and "." not in os.path.basename(title):
+                title = f"{title}.{file_ext}"
+            return {
+                "file_name": title,
+                "file_size": total_len,
+                "attach_id": attach_id,
+                "file_ext": file_ext,
+            }
+        except Exception:
+            return {}
+
+    def _resolve_file_message_meta(self, message: dict) -> dict[str, str]:
+        file_meta = self._extract_file_meta(message)
+        file_name = _safe_text(
+            message.get("FileName") or message.get("Filename") or file_meta.get("file_name")
+        ).strip()
+        file_size = _safe_text(message.get("FileSize") or file_meta.get("file_size")).strip()
+        md5_value = _safe_text(message.get("md5") or message.get("FileMd5")).strip().lower()
+        attach_id = _safe_text(file_meta.get("attach_id")).strip()
+        file_ext = _safe_text(message.get("FileExtend") or file_meta.get("file_ext")).strip().lstrip(".").lower()
+        local_path = self._resolve_media_local_path(message)
+        if not file_name and local_path:
+            file_name = os.path.basename(local_path)
+        if file_name and not os.path.splitext(file_name)[1] and file_ext:
+            file_name = f"{file_name}.{file_ext}"
+        return {
+            "file_name": file_name,
+            "file_size": file_size,
+            "md5": md5_value,
+            "attach_id": attach_id,
+            "file_ext": file_ext,
+            "local_path": local_path,
+        }
+
     def _format_article_prompt(self, message: dict) -> str:
         meta = self._extract_article_meta(message)
         if not meta:
@@ -4218,6 +4395,7 @@ class ClawPlugin(PluginBase):
         *,
         user_text: str,
         use_gateway_attachments: bool = False,
+        quoted_image_as_attachment: bool = False,
     ) -> str:
         msg_type = int(message.get("MsgType") or 0)
         route = self._build_route(message)
@@ -4248,7 +4426,11 @@ class ClawPlugin(PluginBase):
                 prompt = f"{prompt}\n\n{article_prompt}".strip() if prompt else article_prompt
         quote = message.get("Quote")
         if self.quote_include_enable and isinstance(quote, dict):
-            prompt = self._append_quote_context(prompt, quote)
+            prompt = self._append_quote_context(
+                prompt,
+                quote,
+                quoted_image_as_attachment=quoted_image_as_attachment,
+            )
         return f"{identity_header}\n{prompt}".strip() if identity_header else prompt
 
     def _format_gateway_identity_header(self, message: dict, route: Optional[WatchRoute]) -> str:
@@ -4421,45 +4603,39 @@ class ClawPlugin(PluginBase):
         local_path = self._find_existing_image_path(message)
         if local_path and not image_path:
             image_path = local_path
-        if not image_path and md5_value:
-            image_path = f"/app/files/{md5_value}.jpg"
-        gateway_path = ""
-        if self.image_path_forward_enable and image_path:
-            gateway_path = self._map_path_for_gateway(image_path)
-        else:
-            gateway_path = image_path
         raw_content = _safe_text(message.get("Content")).strip()
         base64_payload = raw_content
         if raw_content.startswith("<?xml") or raw_content.startswith("<msg"):
             base64_payload = ""
         approx_bytes = int(len(base64_payload) * 3 / 4) if base64_payload else 0
+        public_url = self._build_public_media_url(
+            local_path or image_path,
+            md5_value=md5_value,
+            file_name=(os.path.basename(image_path) if image_path else ""),
+        )
 
         parts = ["[图片] 已接收"]
         if md5_value:
             parts.append(f"md5={md5_value}")
-        if gateway_path:
-            parts.append(f"path={gateway_path}")
+        if public_url:
+            parts.append(f"url={public_url}")
         if approx_bytes:
             parts.append(f"bytes≈{approx_bytes}")
-        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
+        media_directive = self._build_gateway_media_directive(public_url=public_url)
 
         if self.image_forward_mode == "base64" and base64_payload:
             data_uri_prefix = "data:image;base64,"
             max_chars = self.image_base64_max_chars
-            path_block = f"\n\n[图片路径] {gateway_path}" if (self.image_path_forward_enable and gateway_path) else ""
             directive_block = f"\n{media_directive}" if media_directive else ""
             if max_chars <= 0:
-                return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{base64_payload}{path_block}"
+                return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{base64_payload}"
             preview = base64_payload[:max_chars]
             suffix = "" if len(base64_payload) <= max_chars else "...(已截断)"
-            return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{preview}{suffix}{path_block}"
+            return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{preview}{suffix}"
 
-        if self.image_path_forward_enable and image_path:
-            if self.image_forward_mode == "path":
-                directive_block = f"\n{media_directive}" if media_directive else ""
-                return f"{' '.join(parts)}{directive_block}\n\n[图片路径] {gateway_path}"
+        if public_url:
             directive_block = f"\n{media_directive}" if media_directive else ""
-            return f"{' '.join(parts)}{directive_block}\n\n[图片路径] {gateway_path}"
+            return f"{' '.join(parts)}{directive_block}\n\n[图片链接] {public_url}"
         if media_directive:
             return f"{' '.join(parts)}\n{media_directive}"
         return " ".join(parts)
@@ -4480,16 +4656,30 @@ class ClawPlugin(PluginBase):
             parts.append(f"bytes={approx_bytes}")
         return " ".join(parts).strip()
 
-    def _build_gateway_attachments(self, message: dict) -> list[dict[str, Any]]:
+    def _build_gateway_attachments(self, message: dict) -> tuple[list[dict[str, Any]], dict[str, bool]]:
+        attachments: list[dict[str, Any]] = []
+        meta = {"quoted_image": False}
         msg_type = int(message.get("MsgType") or 0)
         if msg_type == 3:
             payload = self._extract_image_attachment_payload(message)
-            if not payload:
-                return []
-            mime_type = self._guess_image_attachment_mime_type(message, payload)
-            file_name = self._guess_image_attachment_file_name(message, mime_type)
-            return [self._build_gateway_attachment(type_name="image", mime_type=mime_type, file_name=file_name, payload=payload)]
-        return []
+            if payload:
+                mime_type = self._guess_image_attachment_mime_type(message, payload)
+                file_name = self._guess_image_attachment_file_name(message, mime_type)
+                attachments.append(
+                    self._build_gateway_attachment(
+                        type_name="image",
+                        mime_type=mime_type,
+                        file_name=file_name,
+                        payload=payload,
+                    )
+                )
+        quote = message.get("Quote")
+        if self.quote_include_enable and isinstance(quote, dict):
+            quote_attachments = self._build_quote_gateway_attachments(quote)
+            if quote_attachments:
+                attachments.extend(quote_attachments)
+                meta["quoted_image"] = True
+        return attachments, meta
 
     def _build_binary_gateway_attachments(self, message: dict, *, media_type: str) -> list[dict[str, Any]]:
         payload = self._extract_binary_attachment_payload(message)
@@ -4610,7 +4800,10 @@ class ClawPlugin(PluginBase):
             guessed_from_name, _encoding = mimetypes.guess_type(file_name or local_path or "")
             return guessed_from_name or "application/octet-stream"
 
-        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        file_meta = self._resolve_file_message_meta(message) if media_type == "file" else {}
+        file_name = _safe_text(
+            message.get("FileName") or message.get("Filename") or file_meta.get("file_name")
+        ).strip()
         local_path = self._resolve_media_local_path(message)
         guessed_from_name, _encoding = mimetypes.guess_type(file_name or local_path or "")
         if guessed_from_name:
@@ -4623,7 +4816,10 @@ class ClawPlugin(PluginBase):
 
     def _guess_binary_attachment_file_name(self, message: dict, mime_type: str, *, media_type: str) -> str:
         local_path = self._resolve_media_local_path(message)
-        source_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        file_meta = self._resolve_file_message_meta(message) if media_type == "file" else {}
+        source_name = _safe_text(
+            message.get("FileName") or message.get("Filename") or file_meta.get("file_name")
+        ).strip()
         if not source_name and local_path:
             source_name = os.path.basename(local_path)
         if source_name:
@@ -4644,7 +4840,11 @@ class ClawPlugin(PluginBase):
         return f"{stem}{extension}"
 
     def _build_gateway_media_directive(self, *, gateway_path: str = "", public_url: str = "") -> str:
-        candidate = _safe_text(gateway_path).strip()
+        candidate = _safe_text(public_url).strip()
+        if not candidate:
+            candidate = _safe_text(gateway_path).strip()
+        if candidate and not self._looks_like_remote_url(candidate):
+            candidate = ""
         if not candidate:
             return ""
         return f"MEDIA:{candidate}"
@@ -4747,8 +4947,9 @@ class ClawPlugin(PluginBase):
         msg_id = _safe_text(message.get("MsgId")).strip()
 
         if msg_type == 49:
-            file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
-            file_ext = _safe_text(message.get("FileExtend")).strip().lstrip(".")
+            file_meta = self._resolve_file_message_meta(message)
+            file_name = file_meta.get("file_name", "")
+            file_ext = file_meta.get("file_ext", "")
             if file_name and not os.path.splitext(file_name)[1] and file_ext:
                 file_name = f"{file_name}.{file_ext}"
             suffix = os.path.splitext(file_name)[1] if file_name else ""
@@ -4844,13 +5045,13 @@ class ClawPlugin(PluginBase):
         return " ".join(parts).strip()
 
     def _format_file_prompt(self, message: dict) -> str:
-        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
-        file_size = _safe_text(message.get("FileSize")).strip()
-        md5_value = _safe_text(message.get("md5") or message.get("FileMd5")).strip().lower()
-        local_path = self._resolve_media_local_path(message)
-        if not file_name and local_path:
-            file_name = os.path.basename(local_path)
-        if not (file_name or local_path or md5_value):
+        file_meta = self._resolve_file_message_meta(message)
+        file_name = file_meta.get("file_name", "")
+        file_size = file_meta.get("file_size", "")
+        md5_value = file_meta.get("md5", "")
+        local_path = file_meta.get("local_path", "")
+        attach_id = file_meta.get("attach_id", "")
+        if not (file_name or local_path or md5_value or attach_id):
             return ""
 
         public_url = self._build_public_media_url(local_path, md5_value=md5_value, file_name=file_name)
@@ -4861,6 +5062,8 @@ class ClawPlugin(PluginBase):
             parts.append(f"size={file_size}")
         if md5_value:
             parts.append(f"md5={md5_value}")
+        if attach_id:
+            parts.append(f"attach={attach_id}")
         if public_url:
             parts.append(f"url={public_url}")
 
@@ -4870,12 +5073,11 @@ class ClawPlugin(PluginBase):
         return "\n\n".join(blocks).strip()
 
     def _format_file_attachment_prompt(self, message: dict) -> str:
-        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
-        file_size = _safe_text(message.get("FileSize")).strip()
-        md5_value = _safe_text(message.get("md5") or message.get("FileMd5")).strip().lower()
-        local_path = self._resolve_media_local_path(message)
-        if not file_name and local_path:
-            file_name = os.path.basename(local_path)
+        file_meta = self._resolve_file_message_meta(message)
+        file_name = file_meta.get("file_name", "")
+        file_size = file_meta.get("file_size", "")
+        md5_value = file_meta.get("md5", "")
+        local_path = file_meta.get("local_path", "")
         if not file_size and local_path and os.path.isfile(local_path):
             try:
                 file_size = str(os.path.getsize(local_path))
@@ -4914,12 +5116,28 @@ class ClawPlugin(PluginBase):
         existing.sort(key=lambda path: os.path.getsize(path), reverse=True)
         return existing[0]
 
-    def _map_path_for_gateway(self, path: str) -> str:
-        normalized = path
-        if self.image_host_path_prefix and normalized.startswith("/app"):
-            suffix = normalized[len("/app") :]
-            return f"{self.image_host_path_prefix}{suffix}"
-        return normalized
+    def _ensure_public_media_file(self, path: str, resolved_name: str) -> str:
+        source_path = _safe_text(path).strip()
+        file_name = os.path.basename(_safe_text(resolved_name).strip())
+        if not source_path or not file_name or not os.path.isfile(source_path):
+            return ""
+
+        root = "/app" if os.path.isdir("/app") else os.getcwd()
+        public_dir = os.path.join(root, "files")
+        public_path = os.path.join(public_dir, file_name)
+        try:
+            if os.path.exists(public_path):
+                return public_path
+            os.makedirs(public_dir, exist_ok=True)
+            try:
+                os.link(source_path, public_path)
+            except Exception:
+                shutil.copy2(source_path, public_path)
+            if os.path.isfile(public_path):
+                return public_path
+        except Exception as exc:
+            logger.warning("[Claw] 公开媒体文件准备失败 src={} dst={} error={}", source_path, public_path, exc)
+        return ""
 
     def _build_public_media_url(self, path: str, *, md5_value: str = "", file_name: str = "") -> str:
         base_url = self.image_public_base_url
@@ -4932,6 +5150,7 @@ class ClawPlugin(PluginBase):
             resolved_name = f"{md5_value}.jpg"
         if not resolved_name:
             return ""
+        self._ensure_public_media_file(path, resolved_name)
         encoded_name = urllib.parse.quote(resolved_name)
         route = self.image_public_route_prefix.rstrip("/") or "/files"
         return f"{base_url}{route}/{encoded_name}"
@@ -5026,7 +5245,44 @@ class ClawPlugin(PluginBase):
         existing.sort(key=lambda path: (os.path.getmtime(path), os.path.getsize(path)), reverse=True)
         return existing[0]
 
-    def _append_quote_context(self, prompt: str, quote: dict) -> str:
+    def _build_quote_gateway_attachments(self, quote: dict) -> list[dict[str, Any]]:
+        quoted_type = quote.get("MsgType")
+        try:
+            quoted_type = int(quoted_type) if quoted_type is not None else quoted_type
+        except Exception:
+            return []
+        if quoted_type != 3:
+            return []
+
+        quote_xml = _safe_text(quote.get("Content"))
+        md5_value = self._extract_md5_from_img_xml(quote_xml)
+        resource_path = self._extract_resource_path_from_media_xml(quote_xml)
+        local_path = resource_path if (resource_path and os.path.isfile(resource_path)) else ""
+        if not local_path and md5_value:
+            local_path = self._find_existing_file_path(md5_value=md5_value)
+        if not local_path or not os.path.isfile(local_path):
+            return []
+
+        synthetic_message = {
+            "ImagePath": local_path,
+            "ImageMD5": md5_value,
+            "MsgId": _safe_text(quote.get("MsgId")).strip() or "quote-image",
+        }
+        payload = self._extract_image_attachment_payload(synthetic_message)
+        if not payload:
+            return []
+        mime_type = self._guess_image_attachment_mime_type(synthetic_message, payload)
+        file_name = self._guess_image_attachment_file_name(synthetic_message, mime_type)
+        return [
+            self._build_gateway_attachment(
+                type_name="image",
+                mime_type=mime_type,
+                file_name=file_name,
+                payload=payload,
+            )
+        ]
+
+    def _append_quote_context(self, prompt: str, quote: dict, *, quoted_image_as_attachment: bool = False) -> str:
         quoted_type = quote.get("MsgType")
         try:
             quoted_type = int(quoted_type) if quoted_type is not None else quoted_type
@@ -5048,11 +5304,19 @@ class ClawPlugin(PluginBase):
             if cdn_key:
                 parts.append(f"cdnthumbaeskey={cdn_key}")
             quoted_content = " ".join(parts).strip()
-            media_directive = self._build_gateway_media_directive(
-                gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
-            )
-            if media_directive:
-                quoted_content = f"{quoted_content}\n{media_directive}"
+            if quoted_image_as_attachment:
+                quoted_content = f"{quoted_content}\n[引用图片] 已作为网关附件发送"
+            else:
+                public_url = self._build_public_media_url(
+                    local_path,
+                    md5_value=md5_value,
+                    file_name=(os.path.basename(local_path) if local_path else ""),
+                )
+                media_directive = self._build_gateway_media_directive(
+                    public_url=public_url,
+                )
+                if media_directive:
+                    quoted_content = f"{quoted_content}\n{media_directive}"
         elif quoted_type in {34, 43, 62}:
             quote_xml = _safe_text(quote.get("Content"))
             md5_value = self._extract_md5_from_media_xml(quote_xml)
@@ -5066,8 +5330,13 @@ class ClawPlugin(PluginBase):
             if md5_value:
                 parts.append(f"md5={md5_value}")
             quoted_content = " ".join(parts).strip()
+            public_url = self._build_public_media_url(
+                local_path,
+                md5_value=md5_value,
+                file_name=(os.path.basename(local_path) if local_path else ""),
+            )
             media_directive = self._build_gateway_media_directive(
-                gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
+                public_url=public_url,
             )
             if media_directive:
                 quoted_content = f"{quoted_content}\n{media_directive}"
@@ -5138,8 +5407,13 @@ class ClawPlugin(PluginBase):
                 if md5_value:
                     parts.append(f"md5={md5_value}")
                 quoted_content = " ".join(parts).strip()
+                public_url = self._build_public_media_url(
+                    local_path,
+                    md5_value=md5_value,
+                    file_name=safe_title,
+                )
                 media_directive = self._build_gateway_media_directive(
-                    gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
+                    public_url=public_url,
                 )
                 if media_directive:
                     quoted_content = f"{quoted_content}\n{media_directive}"
