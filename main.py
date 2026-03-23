@@ -1,11 +1,12 @@
 """
-@input: websockets、asyncio、tomllib、WechatAPIClient、PluginBase 与装饰器；base64/xml 解析用于图片/链接文章与引用上下文；OpenClaw 斜杠命令直通与方法速查
-@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/引用消息转发；向网关透传会话/发送者标识；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；显式错误自动重试、无事件卡死看门狗兜底与超时幂等重试；不自动下载/回传网关媒体/附件
-@position: plugins/Claw 的核心实现文件，负责命令入口、消息路由、会话命名与网关通信编排
+@input: websockets、asyncio、tomllib、WechatAPIClient、PluginBase 与装饰器；base64/xml 解析用于图片/链接文章与引用上下文；OpenClaw 斜杠命令直通与方法速查；微信路由信息到 OpenClaw `to/groupId/accountId/sessionKey` 的结构化透传，以及通过 `channels.status` 发现网关当前真实支持的消息渠道
+@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/语音/视频/文件/引用消息转发；向网关透传会话/发送者标识；`sessionKey` 保持微信桥接所需的 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态，并仅在渠道已被当前 OpenClaw 版本识别时附带 `agent.channel/replyChannel`；握手时默认声明 `tool-events` 能力以接收实时工具事件；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；管理员 slash 中“真实网关方法”走 RPC，“OpenClaw 原生命令”走 `agent` 并复用当前 sessionKey；当未配置固定 `to-wxids` 时，仅把带 `runId/sessionKey` 的网关事件回推到对应微信会话；唤醒词帮助在本地列出常用命令与功能；图片/语音/视频/文件消息统一优先走网关原生 WS `attachments`（base64 + mimeType + fileName），不再向网关注入本地路径 `MEDIA:<path>` 指令；显式错误只在可恢复场景自动重试，`chat` 无文本终态优先等待兜底收敛，401/权限/账号停用等硬错误不再回打网关；不自动下载或回传网关附件
+@position: plugins/Claw 的核心实现文件，负责消息路由、OpenClaw 会话命名、媒体附件/指令封装、入站媒体落盘与网关通信编排
 @auto-doc: Update header and folder INDEX.md when this file changes
 """
 
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -31,9 +32,12 @@ from WechatAPI import WechatAPIClient
 from utils.decorators import (
     on_article_message,
     on_at_message,
+    on_file_message,
     on_image_message,
     on_quote_message,
     on_text_message,
+    on_video_message,
+    on_voice_message,
 )
 from utils.plugin_base import PluginBase
 
@@ -79,6 +83,37 @@ def _mask_device_signature_payload(payload: Any) -> str:
     return text
 
 
+def _normalize_gateway_caps(value: Any) -> list[str]:
+    caps: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            text = _safe_text(item).strip()
+            if text and text not in caps:
+                caps.append(text)
+    if "tool-events" not in caps:
+        caps.append("tool-events")
+    return caps
+
+
+_OPENCLAW_CHANNEL_ALIASES = {
+    "wx-869": "wechat",
+    "wx869": "wechat",
+    "wechat-869": "wechat",
+}
+
+_OPENCLAW_DELIVERABLE_CHANNELS = {
+    "telegram",
+    "whatsapp",
+    "discord",
+    "irc",
+    "googlechat",
+    "slack",
+    "signal",
+    "imessage",
+    "webchat",
+}
+
+
 @dataclass
 class PendingRequest:
     future: asyncio.Future
@@ -91,6 +126,7 @@ class WatchRoute:
     route_id: str
     to_wxid: str
     sender_wxid: str
+    sender_name: str
     is_group: bool
 
     def session_id(self) -> str:
@@ -176,6 +212,7 @@ class OpenClawGatewayClient:
         self._last_device_auth_debug_log_at = 0.0
         self._device_auth_payload_version = "v3"
         self._default_agent_id = ""
+        self._supported_gateway_channels: set[str] = set()
 
     async def start(self):
         if self._running and self._runner_task and not self._runner_task.done():
@@ -291,6 +328,7 @@ class OpenClawGatewayClient:
             "last_event": self._last_event.get("event") if isinstance(self._last_event, dict) else "",
             "has_challenge_nonce": bool(self._last_challenge_nonce),
             "default_agent_id": self._default_agent_id,
+            "supported_gateway_channels": sorted(self._supported_gateway_channels),
         }
 
     def list_methods(self) -> list[str]:
@@ -304,6 +342,16 @@ class OpenClawGatewayClient:
     def default_agent_id(self) -> str:
         return self._default_agent_id
 
+    def supports_message_channel(self, channel: str) -> bool:
+        normalized = _safe_text(channel).strip().lower()
+        if not normalized:
+            return False
+        if normalized == "webchat":
+            return True
+        if self._supported_gateway_channels:
+            return normalized in self._supported_gateway_channels
+        return normalized in _OPENCLAW_DELIVERABLE_CHANNELS
+
     async def ensure_default_agent_id(self) -> str:
         if self._default_agent_id:
             return self._default_agent_id
@@ -316,6 +364,35 @@ class OpenClawGatewayClient:
             if default_agent:
                 self._default_agent_id = default_agent
         return self._default_agent_id
+
+    async def refresh_supported_message_channels(self) -> set[str]:
+        if "channels.status" not in self.list_methods():
+            return set(self._supported_gateway_channels)
+        try:
+            payload = await self.request(
+                method="channels.status",
+                params={"probe": False, "timeoutMs": 2000},
+                expect_final=False,
+                timeout_seconds=6,
+            )
+        except Exception:
+            return set(self._supported_gateway_channels)
+
+        if not isinstance(payload, dict):
+            return set(self._supported_gateway_channels)
+
+        channels = payload.get("channels")
+        if not isinstance(channels, dict):
+            return set(self._supported_gateway_channels)
+
+        normalized: set[str] = set()
+        for key in channels.keys():
+            text = _safe_text(key).strip().lower()
+            if text:
+                normalized.add(text)
+        if normalized:
+            self._supported_gateway_channels = normalized
+        return set(self._supported_gateway_channels)
 
     def last_event(self) -> Optional[dict]:
         return self._last_event
@@ -517,6 +594,11 @@ class OpenClawGatewayClient:
                 self._hello_ok = payload
                 self._connected_event.set()
                 logger.info("[Claw] OpenClaw 握手成功，协议版本: {}", payload.get("protocol"))
+                if "channels.status" in self.list_methods():
+                    asyncio.create_task(
+                        self.refresh_supported_message_channels(),
+                        name="claw-refresh-gateway-channels",
+                    )
             except Exception as exc:
                 self._last_error = str(exc)
                 logger.error("[Claw] OpenClaw 握手失败: {}", exc)
@@ -790,7 +872,7 @@ class ClawPlugin(PluginBase):
     def __init__(self):
         super().__init__()
         self.bot: Optional[WechatAPIClient] = None
-        self._watch_routes: Dict[str, WatchRoute] = {}
+        self._session_routes: Dict[str, WatchRoute] = {}
         self._route_locks: Dict[str, asyncio.Lock] = {}
         self._pending_run_routes: Dict[str, tuple[WatchRoute, float]] = {}
         self._pending_run_meta: Dict[str, dict] = {}
@@ -799,8 +881,6 @@ class ClawPlugin(PluginBase):
         self._pending_run_stream_sent_at: Dict[str, float] = {}
         self._pending_run_media_fingerprints: Dict[str, set[str]] = {}
         self._pending_run_finalize_locks: Dict[str, asyncio.Lock] = {}
-        self._route_session_key_overrides: Dict[str, str] = {}
-        self._route_session_key_revisions: Dict[str, int] = {}
         self._pending_run_watchdog_task: Optional[asyncio.Task] = None
         self._disable_reason = ""
 
@@ -810,16 +890,10 @@ class ClawPlugin(PluginBase):
 
         event_forward_config = plugin_config.get("EventForward", {})
         self.enable = bool(plugin_config.get("enable", False))
-        self.commands = plugin_config.get("commands", ["/claw", "claw"])
-        self.commands = [str(item).strip() for item in self.commands if str(item).strip()]
-        self.command_keys = sorted({cmd.lower() for cmd in self.commands}, key=len, reverse=True)
         self.max_reply_chars = int(plugin_config.get("max-reply-chars", 1800))
         self.stream_reply_enable = bool(plugin_config.get("stream-reply-enable", False))
 
-        self.default_chat_to = _safe_text(plugin_config.get("default-chat-to")).strip()
         self.default_agent_id = _safe_text(plugin_config.get("default-agent-id")).strip()
-        self.default_channel = _safe_text(plugin_config.get("default-channel")).strip()
-        self.default_account_id = _safe_text(plugin_config.get("default-account-id")).strip()
         self.auto_trigger_enable = bool(plugin_config.get("auto-trigger-enable", True))
         trigger_words = plugin_config.get("trigger-words", ["龙虾"])
         self.trigger_words = [
@@ -843,6 +917,19 @@ class ClawPlugin(PluginBase):
             1.0,
         )
         self.trigger_session_prefix = _safe_text(plugin_config.get("trigger-session-prefix")).strip() or "allbot"
+        configured_gateway_channel = _safe_text(
+            plugin_config.get("gateway-channel") or plugin_config.get("default-channel")
+        ).strip()
+        if not configured_gateway_channel:
+            configured_gateway_channel = (
+                self.trigger_session_prefix
+                if self.trigger_session_prefix not in {"allbot", "wechat"}
+                else "wx-869"
+            )
+        self.gateway_channel = configured_gateway_channel
+        self.gateway_account_id = _safe_text(
+            plugin_config.get("gateway-account-id") or plugin_config.get("default-account-id")
+        ).strip()
         self.trigger_use_session_key = bool(plugin_config.get("trigger-use-session-key", True))
         self.trigger_agent_id = _safe_text(plugin_config.get("trigger-agent-id")).strip()
         self.trigger_auto_default_agent = bool(plugin_config.get("trigger-auto-default-agent", True))
@@ -863,7 +950,7 @@ class ClawPlugin(PluginBase):
 
         method_help_keywords = plugin_config.get(
             "method-help-keywords",
-            ["openclaw命令", "claw命令", "龙虾命令", "命令列表"],
+            ["帮助", "命令", "命令列表", "常用命令"],
         )
         if isinstance(method_help_keywords, str):
             method_help_keywords = [method_help_keywords]
@@ -912,7 +999,7 @@ class ClawPlugin(PluginBase):
         device_token = _safe_text(plugin_config.get("device-token")).strip()
         role = _safe_text(plugin_config.get("role")).strip() or "operator"
         scopes = plugin_config.get("scopes", ["operator.admin"])
-        caps = plugin_config.get("caps", [])
+        caps = _normalize_gateway_caps(plugin_config.get("caps", []))
         command_claims = plugin_config.get("commands-claims", [])
         permissions = plugin_config.get("permissions", {})
 
@@ -958,7 +1045,7 @@ class ClawPlugin(PluginBase):
             device_token=device_token,
             role=role,
             scopes=[str(item) for item in scopes] if isinstance(scopes, list) else ["operator.admin"],
-            caps=[str(item) for item in caps] if isinstance(caps, list) else [],
+            caps=caps,
             command_claims=[str(item) for item in command_claims] if isinstance(command_claims, list) else [],
             permissions=permissions if isinstance(permissions, dict) else {},
             client_id=client_id,
@@ -1101,32 +1188,16 @@ class ClawPlugin(PluginBase):
 
     @on_text_message(priority=45)
     async def handle_text(self, bot: WechatAPIClient, message: dict):
-        handled = await self._handle_command(bot, message)
-        if handled is False:
-            return False
         if self._should_skip_duplicate("text_message", message):
             return bool(self.propagate_to_other_plugins)
-        if self._is_method_help_query(self._extract_user_text(message, strip_at_prefix=False)):
-            if not self._is_global_admin(message):
-                return True
-            await self._reply(bot, message, self._format_method_help())
-            return False
         if await self._maybe_handle_slash_command(bot, message, strip_at_prefix=False):
             return bool(self.propagate_to_other_plugins)
         return await self._handle_trigger(bot, message)
 
     @on_at_message(priority=45)
     async def handle_at(self, bot: WechatAPIClient, message: dict):
-        handled = await self._handle_command(bot, message)
-        if handled is False:
-            return False
         if self._should_skip_duplicate("at_message", message):
             return bool(self.propagate_to_other_plugins)
-        if self._is_method_help_query(self._extract_user_text(message, strip_at_prefix=True)):
-            if not self._is_global_admin(message):
-                return True
-            await self._reply(bot, message, self._format_method_help())
-            return False
         if await self._maybe_handle_slash_command(bot, message, strip_at_prefix=True):
             return bool(self.propagate_to_other_plugins)
         return await self._handle_trigger(
@@ -1138,9 +1209,6 @@ class ClawPlugin(PluginBase):
 
     @on_quote_message(priority=45)
     async def handle_quote(self, bot: WechatAPIClient, message: dict):
-        handled = await self._handle_command(bot, message)
-        if handled is False:
-            return False
         if self._should_skip_duplicate("quote_message", message):
             return bool(self.propagate_to_other_plugins)
         if await self._maybe_handle_slash_command(bot, message, strip_at_prefix=bool(message.get("Ats"))):
@@ -1160,40 +1228,33 @@ class ClawPlugin(PluginBase):
             return True
         return await self._handle_trigger(bot, message, bypass_trigger=self.image_auto_forward_enable)
 
+    @on_voice_message(priority=45)
+    async def handle_voice(self, bot: WechatAPIClient, message: dict):
+        route = self._build_route(message)
+        if route and route.is_group:
+            return True
+        return await self._handle_trigger(bot, message, bypass_trigger=self.image_auto_forward_enable)
+
+    @on_video_message(priority=45)
+    async def handle_video(self, bot: WechatAPIClient, message: dict):
+        route = self._build_route(message)
+        if route and route.is_group:
+            return True
+        return await self._handle_trigger(bot, message, bypass_trigger=self.image_auto_forward_enable)
+
+    @on_file_message(priority=45)
+    async def handle_file(self, bot: WechatAPIClient, message: dict):
+        route = self._build_route(message)
+        if route and route.is_group:
+            return True
+        return await self._handle_trigger(bot, message, bypass_trigger=self.image_auto_forward_enable)
+
     @on_article_message(priority=45)
     async def handle_article(self, bot: WechatAPIClient, message: dict):
-        handled = await self._handle_command(bot, message)
-        if handled is False:
-            return False
-
         route = self._build_route(message)
         if route and route.is_group:
             return True
         return await self._handle_trigger(bot, message, bypass_trigger=True)
-
-    async def _handle_command(self, bot: WechatAPIClient, message: dict):
-        content = self._extract_message_content(message)
-        command_payload = self._extract_command_payload(content)
-        if command_payload is None:
-            return True
-
-        if not self.enable:
-            extra = f"\n原因：{self._disable_reason}" if self._disable_reason else ""
-            await self._reply(
-                bot,
-                message,
-                f"Claw 插件未启用，请先在 plugins/Claw/config.toml 设置 enable=true。{extra}",
-            )
-            return False
-
-        try:
-            response_text = await self._execute_command(command_payload, message)
-        except Exception as exc:
-            logger.exception("[Claw] 命令执行异常")
-            response_text = f"执行失败: {exc}"
-
-        await self._reply(bot, message, response_text)
-        return False
 
     async def _handle_trigger(
         self,
@@ -1212,6 +1273,8 @@ class ClawPlugin(PluginBase):
             return True
 
         user_text = self._extract_user_text(message, strip_at_prefix=strip_at_prefix)
+        if route.is_group and self._looks_like_group_slash_text(user_text):
+            return True
         match = self._match_trigger(user_text) if user_text else None
         should_bypass = bool(bypass_trigger) or (
             allow_private_auto_forward
@@ -1251,6 +1314,45 @@ class ClawPlugin(PluginBase):
                 return run_id
         return ""
 
+    def _remember_session_route(self, session_key: str, route: Optional[WatchRoute]) -> None:
+        key = _safe_text(session_key).strip()
+        if not key or not route or not route.to_wxid:
+            return
+        self._session_routes[key] = route
+
+    def _strip_trigger_prompt(self, user_text: str, match_word: str) -> str:
+        text = _safe_text(user_text).strip()
+        trigger = _safe_text(match_word).strip()
+        if not text:
+            return ""
+        if self.trigger_strip_word and trigger and text.startswith(trigger):
+            stripped = text[len(trigger) :].strip()
+            if stripped:
+                return stripped
+        return text
+
+    def _extract_group_slash_text(self, bot: WechatAPIClient, message: dict, user_text: str) -> str:
+        if not self._is_at_current_bot(message, bot=bot):
+            return ""
+        match = self._match_trigger(user_text)
+        if not match:
+            return ""
+        stripped = self._strip_trigger_prompt(user_text, match.word).strip()
+        if not stripped.startswith("/"):
+            return ""
+        return stripped
+
+    def _looks_like_group_slash_text(self, user_text: str) -> bool:
+        text = _safe_text(user_text).strip()
+        if not text:
+            return False
+        if text.startswith("/"):
+            return True
+        match = self._match_trigger(text)
+        if not match:
+            return False
+        return self._strip_trigger_prompt(text, match.word).strip().startswith("/")
+
     def _create_task_safe(self, coro: Awaitable[Any], *, name: str) -> None:
         task = asyncio.create_task(coro, name=name)
 
@@ -1284,18 +1386,26 @@ class ClawPlugin(PluginBase):
         async with lock:
             if int(message.get("MsgType") or 0) == 3 and self.image_forward_mode == "base64":
                 await self._ensure_image_base64(bot, message)
+            attachments = self._build_gateway_attachments(message)
+            if not attachments:
+                await self._ensure_media_local_path(message)
+                attachments = self._build_gateway_attachments(message)
 
-            prompt_text = user_text
-            if self.trigger_strip_word and match_word and user_text.strip().startswith(match_word):
-                stripped = user_text.strip()[len(match_word) :].strip()
-                prompt_text = stripped or user_text.strip()
+            prompt_text = self._strip_trigger_prompt(user_text, match_word)
+            if match_word and (not prompt_text or self._is_method_help_query(prompt_text)):
+                await self._send_to_route(route, self._format_method_help())
+                return
 
-            prompt = self._build_openclaw_prompt(message, user_text=prompt_text)
+            prompt = self._build_openclaw_prompt(
+                message,
+                user_text=prompt_text,
+                use_gateway_attachments=bool(attachments),
+            )
             if not prompt:
                 return
 
             try:
-                reply_text = await self._forward_to_openclaw(prompt, route)
+                reply_text = await self._forward_to_openclaw(prompt, route, attachments=attachments)
             except Exception as exc:
                 if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
                     logger.warning("[Claw] OpenClaw 请求超时")
@@ -1319,25 +1429,36 @@ class ClawPlugin(PluginBase):
         if not self._is_global_admin(message):
             return False
 
-        user_text = self._extract_user_text(message, strip_at_prefix=strip_at_prefix)
-        if not user_text.startswith("/"):
+        route = self._build_route(message)
+        if not route:
             return False
 
-        lowered = user_text.strip().lower()
-        for cmd in self.command_keys:
-            if cmd.startswith("/") and lowered.startswith(cmd):
+        user_text = self._extract_user_text(message, strip_at_prefix=strip_at_prefix)
+        slash_text = user_text
+        if route.is_group:
+            slash_text = self._extract_group_slash_text(bot, message, user_text)
+            if not slash_text:
                 return False
+        elif not slash_text.startswith("/"):
+            return False
 
-        method, params, expect_final = self._parse_openclaw_slash_command(user_text)
+        method, params, expect_final = self._parse_openclaw_slash_command(slash_text)
         method = self._normalize_gateway_method_name(method)
         if not method:
             return False
 
-        if not self._is_openclaw_slash_command(user_text, message):
+        if not self._is_openclaw_slash_command(slash_text, message):
             return False
 
         self._create_task_safe(
-            self._execute_slash_command_in_background(bot, message, method, params, expect_final),
+            self._execute_slash_command_in_background(
+                bot,
+                message,
+                method,
+                params,
+                expect_final,
+                slash_text,
+            ),
             name=f"claw-slash:{method}:{_safe_text(message.get('MsgId')).strip() or uuid.uuid4().hex[:8]}",
         )
         return True
@@ -1366,11 +1487,6 @@ class ClawPlugin(PluginBase):
         method = first.strip()
         if not method:
             return False
-
-        lowered = f"/{method}".lower()
-        for cmd in self.command_keys:
-            if cmd.startswith("/") and lowered.startswith(cmd):
-                return False
 
         methods = [str(item).strip() for item in (self.gateway.list_methods() or []) if str(item).strip()]
         if methods:
@@ -1415,6 +1531,19 @@ class ClawPlugin(PluginBase):
 
         return method, {"message": rest}, True
 
+    def _slash_uses_gateway_rpc(self, method: str) -> bool:
+        """仅真实存在的网关方法走原始 RPC，其余 slash 视为 OpenClaw 原生命令。"""
+        raw = _safe_text(method).strip()
+        if not raw:
+            return False
+
+        methods = [str(item).strip() for item in (self.gateway.list_methods() or []) if str(item).strip()]
+        if not methods:
+            return True
+
+        canonical = {name.lower(): name for name in methods}
+        return raw.lower() in canonical
+
     async def _execute_slash_command_in_background(
         self,
         bot: WechatAPIClient,
@@ -1422,43 +1551,32 @@ class ClawPlugin(PluginBase):
         method: str,
         params: Optional[dict],
         expect_final: bool,
+        raw_text: str,
     ) -> None:
         route = self._build_route(message)
         if not route:
             return
 
-        method_lower = _safe_text(method).strip().lower()
-        if method_lower in {"new", "reset"}:
-            if not self.trigger_use_session_key:
-                await self._reply(bot, message, "当前未启用 sessionKey（trigger-use-session-key=false），无法执行本地会话重置。")
-                return
-            agent_id = self._resolve_agent_id()
-            if not agent_id and self.trigger_auto_default_agent:
-                agent_id = await self.gateway.ensure_default_agent_id()
-            session_key = self._rotate_session_key(route, agent_id=agent_id)
-            existing_run_id = self._find_pending_run_id_for_route(route)
-            if existing_run_id:
-                logger.info(
-                    "[Claw] slash 会话重置清理旧 pending run route_id={} run_id={}",
-                    route.route_id,
-                    existing_run_id,
-                )
-                self._clear_pending_run(existing_run_id)
-            logger.info(
-                "[Claw] slash 本地会话重置 method={} route_id={} sessionKey={}",
-                method_lower,
-                route.route_id,
-                session_key or "-",
-            )
-            await self._reply(
-                bot,
-                message,
-                f"已重置当前会话上下文（{method_lower}）。\n新的 sessionKey: {session_key}",
-            )
+        if not self.gateway.status_snapshot().get("connected"):
+            await self._reply(bot, message, "OpenClaw 未连接，请检查 Claw 网关配置和连接状态。")
             return
 
-        if not self.gateway.status_snapshot().get("connected"):
-            await self._reply(bot, message, "OpenClaw 未连接，请先执行 /claw connect。")
+        if not self._slash_uses_gateway_rpc(method):
+            logger.info(
+                "[Claw] 执行 native slash via agent method={} sender={} group={}",
+                method,
+                _safe_text(message.get("SenderWxid")).strip() or "-",
+                bool(message.get("IsGroup")),
+            )
+            try:
+                reply_text = await self._forward_to_openclaw(raw_text, route)
+            except Exception as exc:
+                logger.warning("[Claw] native slash 失败 method={} error={}", method, exc)
+                await self._reply(bot, message, f"OpenClaw 命令执行失败: {exc}")
+                return
+
+            if reply_text and reply_text != self._DEFERRED_REPLY:
+                await self._send_openclaw_reply(route, reply_text)
             return
 
         logger.info(
@@ -1689,56 +1807,13 @@ class ClawPlugin(PluginBase):
             return False
         return bot_wxid in ats
 
-    async def _execute_command(self, command_payload: str, message: dict) -> str:
-        if not command_payload:
-            return self._help_text()
-
-        action, _, rest = command_payload.partition(" ")
-        action = action.lower().strip()
-        rest = rest.strip()
-
-        if action in {"help", "h", "?"}:
-            return self._help_text()
-        if action == "status":
-            return self._format_status()
-        if action == "connect":
-            await self.gateway.start()
-            await self.gateway.ensure_connected()
-            return "已连接 OpenClaw Gateway。"
-        if action in {"disconnect", "stop"}:
-            await self.gateway.stop()
-            return "已断开 OpenClaw Gateway 连接。"
-        if action == "methods":
-            methods = self.gateway.list_methods()
-            if not methods:
-                return "当前未获取到方法列表，请先执行 /claw connect。"
-            preview = "\n".join(methods[:80])
-            if len(methods) > 80:
-                preview += f"\n...共 {len(methods)} 个方法"
-            return f"可用方法列表：\n{preview}"
-        if action == "events":
-            events = self.gateway.list_events()
-            if not events:
-                return "当前未获取到事件列表，请先执行 /claw connect。"
-            return "可订阅事件：\n" + "\n".join(events)
-        if action == "watch":
-            return await self._handle_watch(rest, message)
-        if action in {"call", "callf"}:
-            return await self._handle_call(rest, expect_final=(action == "callf"))
-        if action in {"send", "chat"}:
-            method = "send" if action == "send" else "chat.send"
-            expect_final = action == "chat"
-            return await self._handle_send(rest, method=method, expect_final=expect_final)
-        if action == "agent":
-            return await self._handle_agent(rest)
-        if action == "last":
-            event = self.gateway.last_event()
-            if not event:
-                return "暂无最近事件。"
-            return f"最近事件：\n{_dump_json(event)}"
-        return self._help_text()
-
-    async def _forward_to_openclaw(self, prompt: str, route: WatchRoute) -> str:
+    async def _forward_to_openclaw(
+        self,
+        prompt: str,
+        route: WatchRoute,
+        *,
+        attachments: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         session_key = ""
         idempotency_key = uuid.uuid4().hex
         params = {
@@ -1746,6 +1821,9 @@ class ClawPlugin(PluginBase):
             "deliver": False,
             "idempotencyKey": idempotency_key,
         }
+        if attachments:
+            params["attachments"] = attachments
+        params.update(self._build_openclaw_agent_context(route))
         agent_id = self._resolve_agent_id()
         if not agent_id and self.trigger_auto_default_agent:
             agent_id = await self.gateway.ensure_default_agent_id()
@@ -1755,6 +1833,7 @@ class ClawPlugin(PluginBase):
         session_key = self._resolve_session_key(route, agent_id=agent_id)
         if session_key:
             params["sessionKey"] = session_key
+            self._remember_session_route(session_key, route)
 
         expect_final = bool(self.trigger_expect_final)
         timeout_seconds = max(6, int(self.trigger_timeout_seconds))
@@ -1846,31 +1925,86 @@ class ClawPlugin(PluginBase):
         return walk(payload)
 
     def _build_session_key(self, route: WatchRoute, *, agent_id: str = "") -> str:
-        prefix = _safe_text(self.trigger_session_prefix).strip() or "allbot"
-        agent_part = _safe_text(agent_id).strip() or "default"
-        scope = route.route_id
-        digest = hashlib.sha1(f"{prefix}|{scope}".encode("utf-8")).hexdigest()[:24]
-        return f"agent:{agent_part}:{prefix}:{digest}"
+        agent_part = _safe_text(agent_id).strip() or "main"
+        channel = self._resolve_session_channel(route)
+        peer_kind = "group" if route and route.is_group else "direct"
+        scope = self._build_session_scope(route)
+        return f"agent:{agent_part}:{channel}:{peer_kind}:{scope}"
+
+    def _build_session_scope(self, route: WatchRoute) -> str:
+        raw_scope = ""
+        if route:
+            if route.is_group:
+                raw_scope = route.to_wxid
+            else:
+                raw_scope = route.sender_wxid or route.to_wxid
+        scope = _safe_text(raw_scope).strip()
+        if not scope:
+            return "unknown"
+
+        normalized: list[str] = []
+        for char in scope:
+            if char.isalnum() or char in {"@", "_", "-", ".", ":"}:
+                normalized.append(char)
+            else:
+                normalized.append("_")
+        sanitized = "".join(normalized).strip("._:-") or "unknown"
+        if len(sanitized) <= 96:
+            return sanitized
+
+        digest = hashlib.sha1(scope.encode("utf-8")).hexdigest()[:12]
+        return f"{sanitized[:64]}:{digest}"
+
+    def _resolve_openclaw_channel(self, route: Optional[WatchRoute] = None) -> str:
+        channel = _safe_text(self.gateway_channel).strip()
+        if channel:
+            normalized = channel.lower()
+            return _OPENCLAW_CHANNEL_ALIASES.get(normalized, normalized)
+        prefix = _safe_text(self.trigger_session_prefix).strip()
+        if prefix:
+            normalized = prefix.lower()
+            return _OPENCLAW_CHANNEL_ALIASES.get(normalized, normalized)
+        return "wechat"
+
+    def _resolve_session_channel(self, route: Optional[WatchRoute] = None) -> str:
+        channel = _safe_text(self.gateway_channel).strip()
+        if channel:
+            return channel.lower()
+        prefix = _safe_text(self.trigger_session_prefix).strip()
+        if prefix:
+            return prefix.lower()
+        return "wx-869"
+
+    def _build_openclaw_agent_context(self, route: Optional[WatchRoute]) -> dict[str, Any]:
+        if not route:
+            return {}
+
+        channel = self._resolve_openclaw_channel(route)
+        params: dict[str, Any] = {}
+        if self.gateway.supports_message_channel(channel):
+            params["channel"] = channel
+            params["replyChannel"] = channel
+        if self.gateway_account_id:
+            params["accountId"] = self.gateway_account_id
+            params["replyAccountId"] = self.gateway_account_id
+
+        if route.is_group:
+            sender_target = _safe_text(route.sender_wxid).strip()
+            if sender_target:
+                params["to"] = sender_target
+            else:
+                params["to"] = route.to_wxid
+            params["groupId"] = route.to_wxid
+        else:
+            params["to"] = route.to_wxid
+
+        return params
 
     def _resolve_session_key(self, route: WatchRoute, *, agent_id: str) -> str:
-        """获取当前 route 的 sessionKey（支持 /new /reset 产生的 override）。"""
+        """获取当前 route 的 sessionKey。"""
         if not self.trigger_use_session_key:
             return ""
-        override = self._route_session_key_overrides.get(route.route_id)
-        if override:
-            return override
         return self._build_session_key(route, agent_id=agent_id)
-
-    def _rotate_session_key(self, route: WatchRoute, *, agent_id: str) -> str:
-        """为 route 生成一个新的 sessionKey，用于“新会话/重置会话”。"""
-        if not self.trigger_use_session_key:
-            return ""
-        base = self._build_session_key(route, agent_id=agent_id)
-        revision = int(self._route_session_key_revisions.get(route.route_id) or 0) + 1
-        self._route_session_key_revisions[route.route_id] = revision
-        session_key = f"{base}:v{revision}"
-        self._route_session_key_overrides[route.route_id] = session_key
-        return session_key
 
     def _clone_json_payload(self, payload: Any) -> Any:
         try:
@@ -1912,6 +2046,8 @@ class ClawPlugin(PluginBase):
             # accepted 后兜底：用 agent.wait + chat.history 收敛终态文本，避免 WS 事件丢失导致“回复不全/看起来超时”。
             "finalizerStarted": True,
         }
+        if session_key:
+            self._remember_session_route(session_key, route)
         if isinstance(request_params, dict):
             meta["requestParams"] = self._clone_json_payload(request_params)
         self._pending_run_meta[run_id] = meta
@@ -1932,6 +2068,24 @@ class ClawPlugin(PluginBase):
         retry_count = int(meta.get("retryCount") or 0)
         request_params = meta.get("requestParams")
         if retry_count >= self._MAX_EXPLICIT_ERROR_RETRIES or not isinstance(request_params, dict):
+            return False
+
+        pending_text = self._pending_run_texts.get(run_id, "").strip()
+        if pending_text and not self._classify_model_failure_text(pending_text):
+            logger.info(
+                "[Claw] run 已有正常累计文本，跳过自动重试 run_id={} chars={}",
+                run_id,
+                len(pending_text),
+            )
+            return False
+
+        if self._is_non_retryable_run_error(error_kind, error_text):
+            logger.warning(
+                "[Claw] 命中不可重试错误，停止自动重试 run_id={} kind={} error={}",
+                run_id,
+                error_kind or "-",
+                error_text or "-",
+            )
             return False
 
         session_key = _safe_text(meta.get("sessionKey")).strip()
@@ -2054,6 +2208,14 @@ class ClawPlugin(PluginBase):
                     )
                     self._clear_pending_run(run_id)
                     return
+                if self._is_non_retryable_run_error(failure_kind, reply_text):
+                    logger.warning(
+                        "[Claw] agent.wait 收到不可重试模型失败文本，停止自动重试 run_id={} kind={}",
+                        run_id,
+                        failure_kind,
+                    )
+                    self._clear_pending_run(run_id)
+                    return
                 handled = await self._retry_pending_run_via_gateway(
                     run_id,
                     route,
@@ -2089,6 +2251,15 @@ class ClawPlugin(PluginBase):
                 error_kind = "empty_model"
             else:
                 error_kind = "model_error"
+        if self._is_non_retryable_run_error(error_kind, error_text, payload):
+            logger.warning(
+                "[Claw] agent.wait 收到不可重试错误，停止自动重试 run_id={} kind={} error={}",
+                run_id,
+                error_kind,
+                error_text or "-",
+            )
+            self._clear_pending_run(run_id)
+            return
         handled = await self._retry_pending_run_via_gateway(
             run_id,
             route,
@@ -2144,6 +2315,57 @@ class ClawPlugin(PluginBase):
             if value:
                 return value
         return self._extract_openclaw_run_id(frame.get("payload"))
+
+    def _extract_session_key_from_payload(self, payload: Any) -> str:
+        seen: set[int] = set()
+
+        def walk(node: Any, depth: int = 0) -> str:
+            if depth > 8:
+                return ""
+            if isinstance(node, dict):
+                node_id = id(node)
+                if node_id in seen:
+                    return ""
+                seen.add(node_id)
+                for key in ("sessionKey", "session_key"):
+                    value = _safe_text(node.get(key)).strip()
+                    if value:
+                        return value
+                for key in ("data", "payload", "result", "message", "messages", "items", "payloads"):
+                    if key in node:
+                        found = walk(node.get(key), depth + 1)
+                        if found:
+                            return found
+                for value in node.values():
+                    found = walk(value, depth + 1)
+                    if found:
+                        return found
+                return ""
+            if isinstance(node, list):
+                for item in node:
+                    found = walk(item, depth + 1)
+                    if found:
+                        return found
+            return ""
+
+        return walk(payload)
+
+    def _resolve_event_route(self, frame: dict, run_id: str) -> Optional[WatchRoute]:
+        if run_id:
+            pending = self._pending_run_routes.get(run_id)
+            if pending:
+                return pending[0]
+            meta = self._pending_run_meta.get(run_id) or {}
+            session_key = _safe_text(meta.get("sessionKey")).strip()
+            if session_key:
+                route = self._session_routes.get(session_key)
+                if route:
+                    return route
+
+        session_key = self._extract_session_key_from_payload(frame)
+        if session_key:
+            return self._session_routes.get(session_key)
+        return None
 
     def _extract_openclaw_reply_text(self, payload: Any) -> str:
         parts: list[str] = []
@@ -2444,6 +2666,53 @@ class ClawPlugin(PluginBase):
 
         return ""
 
+    def _is_non_retryable_run_error(self, error_kind: str, error_text: str, payload: Any = None) -> bool:
+        if error_kind != "model_error":
+            return False
+
+        parts = [_safe_text(error_text).strip().lower()]
+        if payload is not None:
+            try:
+                parts.append(_safe_text(_compact_json(payload, 1600)).strip().lower())
+            except Exception:
+                pass
+        merged = " ".join(part for part in parts if part)
+        if not merged:
+            return False
+
+        hard_markers = (
+            "account has been deactivated",
+            "has been deactivated",
+            "deactivated",
+            "unauthorized",
+            "forbidden",
+            "permission denied",
+            "access denied",
+            "invalid api key",
+            "incorrect api key",
+            "invalid_api_key",
+            "insufficient quota",
+            "quota exceeded",
+            "billing",
+            "payment required",
+            "model not found",
+            "no such model",
+            "invalid model",
+            "invalid request",
+            "invalid_request",
+            "unsupported model",
+            "unsupported",
+            "未授权",
+            "无权限",
+            "禁止访问",
+            "权限不足",
+            "账号已停用",
+            "账号被停用",
+            "额度不足",
+            "配额不足",
+        )
+        return any(marker in merged for marker in hard_markers)
+
     def _is_terminal_failure_text(self, reply_text: str) -> bool:
         """识别“已重试仍失败/请稍后再试”一类终止提示，避免继续重试或回写到微信。"""
         text = _safe_text(reply_text).strip().lower()
@@ -2636,6 +2905,8 @@ class ClawPlugin(PluginBase):
                     return
 
                 media_sent = await self._maybe_send_gateway_media(run_id, route, payload)
+                meta = self._pending_run_meta.get(run_id) or {}
+                session_key = _safe_text(meta.get("sessionKey")).strip()
 
                 if not self._is_run_completion_event(event_name, payload):
                     return
@@ -2648,6 +2919,7 @@ class ClawPlugin(PluginBase):
                     reply_text = pending_text
                 elif not reply_text:
                     reply_text = pending_text
+                reply_failure_kind = self._classify_model_failure_text(reply_text) if reply_text else ""
 
                 if self._is_explicit_run_error(event_name, payload):
                     error_text = self._extract_openclaw_error_text(payload) or reply_text
@@ -2656,6 +2928,28 @@ class ClawPlugin(PluginBase):
                     error_kind = self._classify_run_error(error_text, payload)
                     if error_kind == "unknown":
                         error_kind = "model_error"
+                    if reply_text and not reply_failure_kind:
+                        logger.warning(
+                            "[Claw] 显式错误事件附带正常文本，按文本终态回写 run_id={} event={}",
+                            run_id,
+                            event_name or "-",
+                        )
+                        await self._finalize_pending_run_once(
+                            run_id,
+                            route,
+                            reply_text,
+                            source=f"event:{event_name or '-'}:text-wins",
+                        )
+                        return
+                    if self._is_non_retryable_run_error(error_kind, error_text, payload):
+                        logger.warning(
+                            "[Claw] 显式错误事件命中不可重试错误，停止自动重试 run_id={} kind={} error={}",
+                            run_id,
+                            error_kind,
+                            error_text or "-",
+                        )
+                        self._clear_pending_run(run_id)
+                        return
                     handled = await self._retry_pending_run_via_gateway(
                         run_id,
                         route,
@@ -2668,19 +2962,24 @@ class ClawPlugin(PluginBase):
                     self._clear_pending_run(run_id)
                     return
 
-                meta = self._pending_run_meta.get(run_id) or {}
-                session_key = _safe_text(meta.get("sessionKey")).strip()
-
                 if event_name == "agent" and session_key and not reply_text:
                     logger.debug("[Claw] agent 完成事件已收到但无文本，等待 agent.wait 兜底(run_id={})", run_id)
                     return
 
                 if reply_text:
-                    failure_kind = self._classify_model_failure_text(reply_text)
+                    failure_kind = reply_failure_kind
                     if failure_kind:
                         if self._is_terminal_failure_text(reply_text):
                             logger.warning(
                                 "[Claw] 终态返回模型失败终止提示，抑制回写 run_id={} kind={}",
+                                run_id,
+                                failure_kind,
+                            )
+                            self._clear_pending_run(run_id)
+                            return
+                        if self._is_non_retryable_run_error(failure_kind, reply_text):
+                            logger.warning(
+                                "[Claw] 终态返回不可重试模型失败文本，停止自动重试 run_id={} kind={}",
                                 run_id,
                                 failure_kind,
                             )
@@ -2710,6 +3009,21 @@ class ClawPlugin(PluginBase):
                     return
 
                 if event_name == "chat" and not media_sent:
+                    if session_key:
+                        finalized = await self._maybe_finalize_run_via_chat_history(
+                            run_id,
+                            route,
+                            session_key,
+                            reason="chat-empty-complete",
+                            min_chars=max(1, len(pending_text)),
+                        )
+                        if finalized:
+                            return
+                        logger.info(
+                            "[Claw] chat 完成事件无文本，等待 agent.wait/chat.history 兜底 run_id={}",
+                            run_id,
+                        )
+                        return
                     error_text = self._extract_openclaw_error_text(payload) or "empty response"
                     error_kind = self._classify_run_error(error_text, payload)
                     if error_kind == "unknown":
@@ -2738,8 +3052,9 @@ class ClawPlugin(PluginBase):
                 self._clear_pending_run(run_id)
                 return
 
-        should_forward = self.event_forward_enable or bool(self._watch_routes)
-        if not should_forward:
+        # 原始网关事件体只允许转发到显式配置的固定目标，
+        # 不能再按“当前会话”回推到微信，避免把 payload 直接发给用户。
+        if not self.event_forward_enable or not self.event_forward_to_wxids:
             return
 
         if self.event_forward_allowed and event_name not in self.event_forward_allowed:
@@ -2752,9 +3067,6 @@ class ClawPlugin(PluginBase):
                 await self.bot.send_text_message(target_wxid, message_text)
             except Exception as exc:
                 logger.warning("[Claw] 事件转发失败(to_wxid={}): {}", target_wxid, exc)
-
-        for route in list(self._watch_routes.values()):
-            await self._send_to_route(route, message_text)
 
     async def _pending_run_watchdog_loop(self) -> None:
         while True:
@@ -3620,7 +3932,8 @@ class ClawPlugin(PluginBase):
         for index, chunk in enumerate(chunks, start=1):
             try:
                 if not mentioned and route.is_group and route.sender_wxid and self.event_mention_in_group:
-                    await self.bot.send_at_message(route.to_wxid, chunk, [route.sender_wxid])
+                    mention_text = await self._build_group_mention_text(self.bot, route, chunk)
+                    await self.bot.send_text_message(route.to_wxid, mention_text, [route.sender_wxid])
                     mentioned = True
                     if index < chunk_total:
                         await asyncio.sleep(0.25)
@@ -3651,7 +3964,8 @@ class ClawPlugin(PluginBase):
         for index, chunk in enumerate(chunks, start=1):
             try:
                 if not mentioned and route.is_group and route.sender_wxid:
-                    await bot.send_at_message(route.to_wxid, chunk, [route.sender_wxid])
+                    mention_text = await self._build_group_mention_text(bot, route, chunk)
+                    await bot.send_text_message(route.to_wxid, mention_text, [route.sender_wxid])
                     mentioned = True
                     if index < chunk_total:
                         await asyncio.sleep(0.25)
@@ -3675,20 +3989,58 @@ class ClawPlugin(PluginBase):
         if not to_wxid:
             return None
 
-        sender_wxid = _safe_text(message.get("SenderWxid")).strip()
-        raw_content = _safe_text(message.get("Content")).strip()
-        if not sender_wxid and ":\n" in raw_content:
-            sender_part, _ = raw_content.split(":\n", 1)
-            sender_wxid = sender_part.strip()
-
         is_group = bool(message.get("IsGroup")) or to_wxid.endswith("@chatroom")
-        route_id = f"{to_wxid}|{sender_wxid}" if is_group else to_wxid
+        sender_wxid = self._extract_sender_wxid(message, is_group=is_group)
+        sender_name = self._extract_sender_name(message, sender_wxid=sender_wxid, is_group=is_group)
+        route_id = to_wxid
         return WatchRoute(
             route_id=route_id,
             to_wxid=to_wxid,
             sender_wxid=sender_wxid,
+            sender_name=sender_name,
             is_group=is_group,
         )
+
+    def _extract_sender_wxid(self, message: dict, *, is_group: bool) -> str:
+        for key in ("SenderWxid", "ActualUserWxid", "sender_wxid", "actual_user_wxid"):
+            value = _safe_text(message.get(key)).strip()
+            if value:
+                return value
+
+        raw_content = _safe_text(message.get("Content")).strip()
+        if is_group:
+            for marker in (":\n", ":"):
+                if marker not in raw_content:
+                    continue
+                sender_part, _ = raw_content.split(marker, 1)
+                sender_part = sender_part.strip()
+                if sender_part and " " not in sender_part and len(sender_part) <= 96:
+                    return sender_part
+
+        return ""
+
+    def _extract_sender_name(self, message: dict, *, sender_wxid: str, is_group: bool) -> str:
+        candidates = [
+            _safe_text(message.get("SenderName")).strip(),
+            _safe_text(message.get("sender_name")).strip(),
+            _safe_text(message.get("DisplayName")).strip(),
+            _safe_text(message.get("display_name")).strip(),
+            _safe_text(message.get("NickName")).strip(),
+            _safe_text(message.get("nickname")).strip(),
+        ]
+
+        push_content = _safe_text(message.get("PushContent")).strip()
+        if is_group and push_content:
+            for marker in (" : ", ":", "\n"):
+                if marker in push_content:
+                    prefix, _ = push_content.split(marker, 1)
+                    candidates.append(prefix.strip())
+                    break
+
+        for candidate in candidates:
+            if candidate and not self._looks_like_wxid_text(candidate, wxid=sender_wxid):
+                return candidate
+        return ""
 
     def _extract_message_content(self, message: dict) -> str:
         content = _safe_text(message.get("Content")).replace("\u2005", " ").strip()
@@ -3788,44 +4140,30 @@ class ClawPlugin(PluginBase):
         return "网关方法（参数请按 OpenClaw 文档/返回提示）。"
 
     def _format_method_help(self) -> str:
-        methods = self.gateway.list_methods()
-        if not methods:
-            return "当前未获取到 OpenClaw 方法列表，请先执行 /claw connect。"
-
-        def normalize(item: str) -> str:
-            return _safe_text(item).strip()
-
-        method_set = {normalize(item) for item in methods if normalize(item)}
-        preferred = [
-            "health",
-            "help",
-            "agent",
-            "chat.send",
-            "chat.history",
-            "operator.info",
-            "operator.keys.list",
-            "operator.keys.create",
-        ]
-        common = [item for item in preferred if item in method_set]
-        others = sorted(item for item in method_set if item not in set(common))
-
         lines: list[str] = [
-            "OpenClaw 命令/方法速查（直接以 /<method> 调用）：",
+            "龙虾常用命令：",
+            "- /new：开启新会话，清空当前聊天对象的上下文",
+            "- /reset：重置当前会话，效果与 /new 接近",
+            "- /model：查看或切换当前会话模型",
+            "- /think <level>：设置思考强度，例如 low/medium/high",
+            "- /verbose <level>：调整输出详细程度",
+            "- /reasoning <level>：调整推理强度",
+            "- /compact：压缩当前会话上下文，减少历史占用",
+            "- /status：查看当前状态",
+            "- /help：查看 OpenClaw 内置帮助",
+            "- /stop：停止当前正在进行的回复",
             "",
-            "常用：",
+            "使用方式：",
+            "- 私聊直接发送：/命令",
+            "- 群聊管理员命令：@机器人 龙虾 /命令",
+            "- 对话帮助：发送“龙虾 帮助”或“龙虾 命令”",
+            "- 普通提问：发送“龙虾 你的问题”",
+            "",
+            "说明：",
+            "- 上述命令默认作用于当前聊天对象对应的会话",
+            "- 私聊按对方 wxid 记忆上下文，群聊按群 id 记忆上下文",
+            "- 群聊中的 /命令 不会再直接透传；只有管理员同时满足 @机器人 + 唤醒词 才会执行",
         ]
-        lines.extend(f"- /{name}：{self._describe_openclaw_method(name)}" for name in common)
-        if others:
-            lines.append("")
-            lines.append("全部方法：")
-            lines.extend(f"- /{name}：{self._describe_openclaw_method(name)}" for name in others)
-        lines.append("")
-        lines.append("用法示例：")
-        lines.append("- /health")
-        lines.append("- /agent 你好")
-        lines.append("- /chat.send {\"sessionKey\":\"...\",\"message\":\"...\"}")
-        lines.append("")
-        lines.append("说明：以上为网关暴露的方法列表，具体参数结构以网关文档/返回为准。")
         return "\n".join(lines).strip()
 
     def _extract_article_meta(self, message: dict) -> dict:
@@ -3874,15 +4212,29 @@ class ClawPlugin(PluginBase):
             lines.append(f"- 封面: {thumburl}")
         return "\n".join(lines).strip()
 
-    def _build_openclaw_prompt(self, message: dict, *, user_text: str) -> str:
+    def _build_openclaw_prompt(
+        self,
+        message: dict,
+        *,
+        user_text: str,
+        use_gateway_attachments: bool = False,
+    ) -> str:
         msg_type = int(message.get("MsgType") or 0)
         route = self._build_route(message)
         identity_header = self._format_gateway_identity_header(message, route)
         if msg_type == 3:
-            image_payload = self._format_image_prompt(message)
+            image_payload = self._format_image_attachment_prompt(message)
             return f"{identity_header}\n{image_payload}".strip() if identity_header else image_payload
+        if msg_type in {34, 43}:
+            media_label = "语音" if msg_type == 34 else "视频"
+            media_payload = self._format_binary_media_attachment_prompt(message, media_label=media_label)
+            return f"{identity_header}\n{media_payload}".strip() if identity_header else media_payload
         prompt = user_text.strip()
         if msg_type == 49:
+            file_prompt = self._format_file_attachment_prompt(message)
+            if file_prompt:
+                prompt = f"{prompt}\n\n{file_prompt}".strip() if prompt else file_prompt
+                return f"{identity_header}\n{prompt}".strip() if identity_header else prompt
             article_prompt = self._format_article_prompt(message)
             if article_prompt:
                 prompt = f"{prompt}\n\n{article_prompt}".strip() if prompt else article_prompt
@@ -3897,7 +4249,11 @@ class ClawPlugin(PluginBase):
             return ""
 
         sender_wxid = route.sender_wxid or ""
-        sender_name = self._lookup_contact_display(sender_wxid) if sender_wxid else ""
+        sender_name = self._extract_sender_name(message, sender_wxid=sender_wxid, is_group=route.is_group)
+        if not sender_name and route.sender_name:
+            sender_name = route.sender_name
+        if not sender_name and sender_wxid:
+            sender_name = self._lookup_contact_display(sender_wxid)
         chat_name = self._lookup_contact_display(route.to_wxid) if route.to_wxid else ""
         msg_id = _safe_text(message.get("MsgId")).strip()
 
@@ -3928,9 +4284,59 @@ class ClawPlugin(PluginBase):
                 return ""
             remark = _safe_text(contact.get("remark")).strip()
             nickname = _safe_text(contact.get("nickname")).strip()
-            return remark or nickname
+            display = remark or nickname
+            return "" if self._looks_like_wxid_text(display, wxid=wxid) else display
         except Exception:
             return ""
+
+    def _looks_like_wxid_text(self, text: str, *, wxid: str = "") -> bool:
+        value = _safe_text(text).strip()
+        wxid_text = _safe_text(wxid).strip()
+        if not value:
+            return True
+        lowered = value.lower()
+        if wxid_text and value == wxid_text:
+            return True
+        if lowered.startswith("wxid_"):
+            return True
+        if lowered.endswith("@chatroom"):
+            return True
+        if re.fullmatch(r"[A-Za-z0-9_@.-]{12,}", value):
+            return True
+        return False
+
+    def _lookup_group_member_display(self, bot: WechatAPIClient, route: WatchRoute) -> str:
+        sender_wxid = _safe_text(route.sender_wxid).strip()
+        if not route.is_group or not sender_wxid:
+            return ""
+        if route.sender_name and not self._looks_like_wxid_text(route.sender_name, wxid=sender_wxid):
+            return route.sender_name
+
+        getter = getattr(bot, "get_local_nickname", None)
+        if callable(getter):
+            try:
+                nickname = _safe_text(getter(sender_wxid, route.to_wxid)).strip()
+                if nickname and not self._looks_like_wxid_text(nickname, wxid=sender_wxid):
+                    return nickname
+            except Exception:
+                pass
+        return self._lookup_contact_display(sender_wxid)
+
+    async def _build_group_mention_text(self, bot: WechatAPIClient, route: WatchRoute, content: str) -> str:
+        sender_wxid = _safe_text(route.sender_wxid).strip()
+        if not route.is_group or not sender_wxid:
+            return content
+
+        nickname = self._lookup_group_member_display(bot, route)
+        if not nickname:
+            try:
+                fetched = await bot.get_nickname(sender_wxid)
+            except Exception:
+                fetched = ""
+            nickname = _safe_text(fetched).strip()
+        if self._looks_like_wxid_text(nickname, wxid=sender_wxid):
+            return content
+        return f"@{nickname}\u2005{content}"
 
     def _extract_md5_from_img_xml(self, xml_text: str) -> str:
         raw = _safe_text(xml_text).strip()
@@ -4014,7 +4420,6 @@ class ClawPlugin(PluginBase):
             gateway_path = self._map_path_for_gateway(image_path)
         else:
             gateway_path = image_path
-        public_url = self._build_public_media_url(gateway_path, md5_value=md5_value)
         raw_content = _safe_text(message.get("Content")).strip()
         base64_payload = raw_content
         if raw_content.startswith("<?xml") or raw_content.startswith("<msg"):
@@ -4026,29 +4431,471 @@ class ClawPlugin(PluginBase):
             parts.append(f"md5={md5_value}")
         if gateway_path:
             parts.append(f"path={gateway_path}")
-        if public_url:
-            parts.append(f"url={public_url}")
         if approx_bytes:
             parts.append(f"bytes≈{approx_bytes}")
+        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
 
         if self.image_forward_mode == "base64" and base64_payload:
             data_uri_prefix = "data:image;base64,"
             max_chars = self.image_base64_max_chars
             path_block = f"\n\n[图片路径] {gateway_path}" if (self.image_path_forward_enable and gateway_path) else ""
-            url_block = f"\n\n[图片链接] {public_url}" if public_url else ""
+            directive_block = f"\n{media_directive}" if media_directive else ""
             if max_chars <= 0:
-                return f"{' '.join(parts)}\n\n[图片] {data_uri_prefix}{base64_payload}{path_block}{url_block}"
+                return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{base64_payload}{path_block}"
             preview = base64_payload[:max_chars]
             suffix = "" if len(base64_payload) <= max_chars else "...(已截断)"
-            return f"{' '.join(parts)}\n\n[图片] {data_uri_prefix}{preview}{suffix}{path_block}{url_block}"
+            return f"{' '.join(parts)}{directive_block}\n\n[图片] {data_uri_prefix}{preview}{suffix}{path_block}"
 
         if self.image_path_forward_enable and image_path:
             if self.image_forward_mode == "path":
-                url_block = f"\n\n[图片链接] {public_url}" if public_url else ""
-                return f"{' '.join(parts)}\n\n[图片路径] {gateway_path}{url_block}"
-            url_block = f"\n\n[图片链接] {public_url}" if public_url else ""
-            return f"{' '.join(parts)}\n\n[图片路径] {gateway_path}{url_block}"
+                directive_block = f"\n{media_directive}" if media_directive else ""
+                return f"{' '.join(parts)}{directive_block}\n\n[图片路径] {gateway_path}"
+            directive_block = f"\n{media_directive}" if media_directive else ""
+            return f"{' '.join(parts)}{directive_block}\n\n[图片路径] {gateway_path}"
+        if media_directive:
+            return f"{' '.join(parts)}\n{media_directive}"
         return " ".join(parts)
+
+    def _format_image_attachment_prompt(self, message: dict) -> str:
+        md5_value = _safe_text(message.get("ImageMD5")).strip()
+        raw_content = _safe_text(message.get("Content")).strip()
+        approx_bytes = 0
+        if raw_content and not (raw_content.startswith("<?xml") or raw_content.startswith("<msg")):
+            try:
+                approx_bytes = len(base64.b64decode(raw_content, validate=False))
+            except Exception:
+                approx_bytes = 0
+        parts = ["[图片] 已接收"]
+        if md5_value:
+            parts.append(f"md5={md5_value}")
+        if approx_bytes:
+            parts.append(f"bytes={approx_bytes}")
+        return " ".join(parts).strip()
+
+    def _build_gateway_attachments(self, message: dict) -> list[dict[str, Any]]:
+        msg_type = int(message.get("MsgType") or 0)
+        if msg_type == 3:
+            payload = self._extract_image_attachment_payload(message)
+            if not payload:
+                return []
+            mime_type = self._guess_image_attachment_mime_type(message, payload)
+            file_name = self._guess_image_attachment_file_name(message, mime_type)
+            return [self._build_gateway_attachment(type_name="image", mime_type=mime_type, file_name=file_name, payload=payload)]
+        if msg_type == 34:
+            return self._build_binary_gateway_attachments(message, media_type="audio")
+        if msg_type == 43:
+            return self._build_binary_gateway_attachments(message, media_type="video")
+        if msg_type == 49:
+            return self._build_binary_gateway_attachments(message, media_type="file")
+        return []
+
+    def _build_binary_gateway_attachments(self, message: dict, *, media_type: str) -> list[dict[str, Any]]:
+        payload = self._extract_binary_attachment_payload(message)
+        if not payload:
+            return []
+
+        mime_type = self._guess_binary_attachment_mime_type(message, payload, media_type=media_type)
+        file_name = self._guess_binary_attachment_file_name(message, mime_type, media_type=media_type)
+        return [
+            self._build_gateway_attachment(
+                type_name=media_type,
+                mime_type=mime_type,
+                file_name=file_name,
+                payload=payload,
+            )
+        ]
+
+    def _build_gateway_attachment(
+        self,
+        *,
+        type_name: str,
+        mime_type: str,
+        file_name: str,
+        payload: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": type_name,
+            "mimeType": mime_type,
+            "fileName": file_name,
+            "content": payload,
+            "source": {
+                "type": "base64",
+                "media_type": mime_type,
+                "data": payload,
+            },
+        }
+
+    def _extract_image_attachment_payload(self, message: dict) -> str:
+        raw_content = _safe_text(message.get("Content")).strip()
+        if self._is_probably_base64(raw_content):
+            return raw_content
+
+        image_path = self._find_existing_image_path(message)
+        if image_path and os.path.isfile(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+            except Exception:
+                return ""
+        return ""
+
+    def _guess_image_attachment_mime_type(self, message: dict, payload_base64: str) -> str:
+        image_path = _safe_text(message.get("ImagePath")).strip()
+        guessed_from_path, _encoding = mimetypes.guess_type(image_path)
+        if guessed_from_path and guessed_from_path.startswith("image/"):
+            return guessed_from_path
+        try:
+            header = base64.b64decode(payload_base64[:128], validate=False)
+        except Exception:
+            header = b""
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if header.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if header.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if header.startswith(b"RIFF") and b"WEBP" in header[:16]:
+            return "image/webp"
+        return "image/jpeg"
+
+    def _guess_image_attachment_file_name(self, message: dict, mime_type: str) -> str:
+        image_path = _safe_text(message.get("ImagePath")).strip()
+        base_name = os.path.basename(image_path) if image_path else ""
+        if base_name:
+            return base_name
+        md5_value = _safe_text(message.get("ImageMD5")).strip().lower()
+        extension = mimetypes.guess_extension(mime_type) or ".jpg"
+        stem = md5_value or (_safe_text(message.get("MsgId")).strip() or uuid.uuid4().hex[:12])
+        return f"{stem}{extension}"
+
+    def _extract_binary_attachment_payload(self, message: dict) -> str:
+        payload = self._extract_inbound_media_payload(message)
+        if payload:
+            return base64.b64encode(payload).decode("utf-8")
+
+        local_path = self._resolve_media_local_path(message)
+        if local_path and os.path.isfile(local_path):
+            try:
+                with open(local_path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+            except Exception:
+                return ""
+        return ""
+
+    def _guess_binary_attachment_mime_type(self, message: dict, payload_base64: str, *, media_type: str) -> str:
+        try:
+            header = base64.b64decode(payload_base64[:256], validate=False)
+        except Exception:
+            header = b""
+
+        if media_type == "audio":
+            if header.startswith(b"RIFF"):
+                return "audio/wav"
+            if header.startswith(b"#!SILK_V3"):
+                return "audio/silk"
+            if header.startswith(b"ID3") or (len(header) >= 2 and header[:2] == b"\xff\xfb"):
+                return "audio/mpeg"
+            file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+            local_path = self._resolve_media_local_path(message)
+            guessed_from_name, _encoding = mimetypes.guess_type(file_name or local_path or "")
+            return guessed_from_name or "application/octet-stream"
+
+        if media_type == "video":
+            if len(header) >= 12 and header[4:8] == b"ftyp":
+                return "video/mp4"
+            file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+            local_path = self._resolve_media_local_path(message)
+            guessed_from_name, _encoding = mimetypes.guess_type(file_name or local_path or "")
+            return guessed_from_name or "application/octet-stream"
+
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        local_path = self._resolve_media_local_path(message)
+        guessed_from_name, _encoding = mimetypes.guess_type(file_name or local_path or "")
+        if guessed_from_name:
+            return guessed_from_name
+        if header.startswith(b"%PDF-"):
+            return "application/pdf"
+        if header.startswith((b"{", b"[")):
+            return "application/json"
+        return "application/octet-stream"
+
+    def _guess_binary_attachment_file_name(self, message: dict, mime_type: str, *, media_type: str) -> str:
+        local_path = self._resolve_media_local_path(message)
+        source_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        if not source_name and local_path:
+            source_name = os.path.basename(local_path)
+        if source_name:
+            return self._sanitize_media_filename(
+                source_name,
+                fallback_stem=f"{media_type}-{_safe_text(message.get('MsgId')).strip() or 'media'}",
+            )
+
+        md5_value = _safe_text(
+            message.get("md5") or message.get("FileMd5") or message.get("ImageMD5")
+        ).strip().lower()
+        extension = mimetypes.guess_extension(mime_type) or {
+            "audio": ".bin",
+            "video": ".bin",
+            "file": ".bin",
+        }.get(media_type, ".bin")
+        stem = md5_value or (_safe_text(message.get("MsgId")).strip() or uuid.uuid4().hex[:12])
+        return f"{stem}{extension}"
+
+    def _build_gateway_media_directive(self, *, gateway_path: str = "", public_url: str = "") -> str:
+        candidate = _safe_text(gateway_path).strip()
+        if not candidate:
+            return ""
+        return f"MEDIA:{candidate}"
+
+    async def _ensure_media_local_path(self, message: dict) -> str:
+        local_path = self._resolve_media_local_path(message)
+        if local_path:
+            return local_path
+
+        payload = self._extract_inbound_media_payload(message)
+        if not payload:
+            return ""
+
+        file_path = self._persist_inbound_media_payload(message, payload)
+        if not file_path:
+            return ""
+
+        msg_type = int(message.get("MsgType") or 0)
+        message["ResourcePath"] = file_path
+        if msg_type == 3:
+            message["ImagePath"] = file_path
+        elif msg_type == 34:
+            message["voice_path"] = file_path
+        elif msg_type == 43:
+            message["video_path"] = file_path
+        elif msg_type == 49:
+            message["FilePath"] = file_path
+        return file_path
+
+    def _extract_inbound_media_payload(self, message: dict) -> bytes:
+        msg_type = int(message.get("MsgType") or 0)
+        candidates: list[Any] = []
+        if msg_type == 3:
+            candidates.append(message.get("Content"))
+        elif msg_type == 34:
+            candidates.append(message.get("Content"))
+        elif msg_type == 43:
+            candidates.append(message.get("Video"))
+        elif msg_type == 49:
+            candidates.append(message.get("File"))
+
+        for candidate in candidates:
+            payload = self._coerce_media_payload_bytes(candidate)
+            if payload:
+                return payload
+        return b""
+
+    def _coerce_media_payload_bytes(self, payload: Any) -> bytes:
+        if isinstance(payload, memoryview):
+            return payload.tobytes()
+        if isinstance(payload, bytearray):
+            return bytes(payload)
+        if isinstance(payload, bytes):
+            return payload
+
+        raw = _safe_text(payload).strip()
+        if not raw:
+            return b""
+        if raw.startswith("<?xml") or raw.startswith("<msg"):
+            return b""
+        if raw.startswith("data:") and ";base64," in raw:
+            raw = raw.split(";base64,", 1)[1].strip()
+        try:
+            return base64.b64decode(raw, validate=False)
+        except Exception:
+            return b""
+
+    def _persist_inbound_media_payload(self, message: dict, payload: bytes) -> str:
+        if not payload:
+            return ""
+
+        target_dir = self._get_gateway_media_store_dir()
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except Exception as exc:
+            logger.warning("[Claw] 创建媒体落盘目录失败 dir={} error={}", target_dir, exc)
+            return ""
+
+        file_name = self._build_inbound_media_file_name(message, payload)
+        if not file_name:
+            return ""
+
+        file_path = os.path.join(target_dir, file_name)
+        try:
+            if not os.path.isfile(file_path):
+                with open(file_path, "wb") as f:
+                    f.write(payload)
+            return file_path
+        except Exception as exc:
+            logger.warning("[Claw] 媒体落盘失败 path={} error={}", file_path, exc)
+            return ""
+
+    def _get_gateway_media_store_dir(self) -> str:
+        root = "/app" if os.path.isdir("/app") else os.getcwd()
+        return os.path.join(root, "files", "claw-media")
+
+    def _build_inbound_media_file_name(self, message: dict, payload: bytes) -> str:
+        msg_type = int(message.get("MsgType") or 0)
+        md5_value = _safe_text(message.get("md5") or message.get("FileMd5") or message.get("ImageMD5")).strip().lower()
+        msg_id = _safe_text(message.get("MsgId")).strip()
+
+        if msg_type == 49:
+            file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+            file_ext = _safe_text(message.get("FileExtend")).strip().lstrip(".")
+            if file_name and not os.path.splitext(file_name)[1] and file_ext:
+                file_name = f"{file_name}.{file_ext}"
+            suffix = os.path.splitext(file_name)[1] if file_name else ""
+            if not suffix and file_ext:
+                suffix = f".{file_ext}"
+            if not suffix:
+                suffix = ".bin"
+            if md5_value:
+                return f"{md5_value}{suffix.lower()}"
+            if file_name:
+                return self._sanitize_media_filename(file_name, fallback_stem=f"file-{msg_id or 'media'}")
+            return f"file-{msg_id or hashlib.sha256(payload).hexdigest()[:16]}{suffix.lower()}"
+
+        if msg_type == 34:
+            stem = md5_value or msg_id or hashlib.sha256(payload).hexdigest()[:16]
+            return f"{stem}.wav"
+
+        if msg_type == 43:
+            stem = md5_value or msg_id or hashlib.sha256(payload).hexdigest()[:16]
+            return f"{stem}.mp4"
+
+        if msg_type == 3:
+            stem = md5_value or msg_id or hashlib.sha256(payload).hexdigest()[:16]
+            return f"{stem}.jpg"
+
+        return ""
+
+    def _sanitize_media_filename(self, file_name: str, *, fallback_stem: str) -> str:
+        safe_name = os.path.basename(_safe_text(file_name).strip())
+        safe_name = re.sub(r'[\\/*?:"<>|]+', "_", safe_name).strip(" .")
+        if not safe_name:
+            safe_name = fallback_stem
+        stem, suffix = os.path.splitext(safe_name)
+        stem = stem[:160] or fallback_stem
+        suffix = suffix[:32]
+        return f"{stem}{suffix}"
+
+    def _resolve_media_local_path(self, message: dict) -> str:
+        for key in ("ResourcePath", "FilePath", "ImagePath", "video_path", "voice_path"):
+            candidate = _safe_text(message.get(key)).strip()
+            if candidate and os.path.isfile(candidate):
+                return candidate
+
+        content_xml = _safe_text(message.get("Content")).strip()
+        resource_path = self._extract_resource_path_from_media_xml(content_xml)
+        if resource_path and os.path.isfile(resource_path):
+            return resource_path
+
+        md5_value = _safe_text(message.get("md5") or message.get("ImageMD5")).strip().lower()
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        return self._find_existing_file_path(md5_value=md5_value, file_name=file_name)
+
+    def _format_binary_media_prompt(self, message: dict, *, media_label: str) -> str:
+        local_path = self._resolve_media_local_path(message)
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        if not file_name and local_path:
+            file_name = os.path.basename(local_path)
+        md5_value = _safe_text(message.get("md5") or message.get("ImageMD5")).strip().lower()
+        gateway_path = self._map_path_for_gateway(local_path) if local_path else ""
+        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
+        parts = [f"[{media_label}] 已接收"]
+        if file_name:
+            parts.append(file_name)
+        if md5_value:
+            parts.append(f"md5={md5_value}")
+        if gateway_path:
+            parts.append(f"path={gateway_path}")
+
+        blocks = [" ".join(parts).strip()]
+        if media_directive:
+            blocks.append(media_directive)
+        if gateway_path:
+            blocks.append(f"[{media_label}路径] {gateway_path}")
+        return "\n\n".join(blocks).strip()
+
+    def _format_binary_media_attachment_prompt(self, message: dict, *, media_label: str) -> str:
+        local_path = self._resolve_media_local_path(message)
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        if not file_name and local_path:
+            file_name = os.path.basename(local_path)
+        md5_value = _safe_text(message.get("md5") or message.get("ImageMD5")).strip().lower()
+        file_size = ""
+        if local_path and os.path.isfile(local_path):
+            try:
+                file_size = str(os.path.getsize(local_path))
+            except Exception:
+                file_size = ""
+
+        parts = [f"[{media_label}] 已接收"]
+        if file_name:
+            parts.append(file_name)
+        if file_size:
+            parts.append(f"bytes={file_size}")
+        if md5_value:
+            parts.append(f"md5={md5_value}")
+        return " ".join(parts).strip()
+
+    def _format_file_prompt(self, message: dict) -> str:
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        file_size = _safe_text(message.get("FileSize")).strip()
+        md5_value = _safe_text(message.get("md5") or message.get("FileMd5")).strip().lower()
+        local_path = self._resolve_media_local_path(message)
+        if not file_name and local_path:
+            file_name = os.path.basename(local_path)
+        if not (file_name or local_path or md5_value):
+            return ""
+
+        gateway_path = self._map_path_for_gateway(local_path) if local_path else ""
+        media_directive = self._build_gateway_media_directive(gateway_path=gateway_path)
+        parts = ["[文件] 已接收"]
+        if file_name:
+            parts.append(file_name)
+        if file_size:
+            parts.append(f"size={file_size}")
+        if md5_value:
+            parts.append(f"md5={md5_value}")
+        if gateway_path:
+            parts.append(f"path={gateway_path}")
+
+        blocks = [" ".join(parts).strip()]
+        if media_directive:
+            blocks.append(media_directive)
+        if gateway_path:
+            blocks.append(f"[文件路径] {gateway_path}")
+        return "\n\n".join(blocks).strip()
+
+    def _format_file_attachment_prompt(self, message: dict) -> str:
+        file_name = _safe_text(message.get("FileName") or message.get("Filename")).strip()
+        file_size = _safe_text(message.get("FileSize")).strip()
+        md5_value = _safe_text(message.get("md5") or message.get("FileMd5")).strip().lower()
+        local_path = self._resolve_media_local_path(message)
+        if not file_name and local_path:
+            file_name = os.path.basename(local_path)
+        if not file_size and local_path and os.path.isfile(local_path):
+            try:
+                file_size = str(os.path.getsize(local_path))
+            except Exception:
+                file_size = ""
+        if not (file_name or local_path or md5_value):
+            return ""
+
+        parts = ["[文件] 已接收"]
+        if file_name:
+            parts.append(file_name)
+        if file_size:
+            parts.append(f"size={file_size}")
+        if md5_value:
+            parts.append(f"md5={md5_value}")
+        return " ".join(parts).strip()
 
     def _find_existing_image_path(self, message: dict) -> str:
         image_path = _safe_text(message.get("ImagePath")).strip()
@@ -4156,23 +5003,31 @@ class ClawPlugin(PluginBase):
     def _find_existing_file_path(self, *, md5_value: str = "", file_name: str = "") -> str:
         roots = [os.getcwd(), "/app"]
         safe_name = os.path.basename(_safe_text(file_name).strip()) if file_name else ""
+        candidates: list[str] = []
         for root in roots:
             if safe_name:
                 candidate = os.path.join(root, "files", safe_name)
                 if os.path.isfile(candidate):
                     return candidate
+                nested_pattern = os.path.join(root, "files", "**", safe_name)
+                candidates.extend(glob.glob(nested_pattern, recursive=True))
 
         md5_value = _safe_text(md5_value).strip()
         if not md5_value:
-            return ""
-        candidates: list[str] = []
+            existing = [path for path in candidates if os.path.isfile(path)]
+            if not existing:
+                return ""
+            existing.sort(key=lambda path: (os.path.getmtime(path), os.path.getsize(path)), reverse=True)
+            return existing[0]
         for root in roots:
             pattern = os.path.join(root, "files", f"{md5_value}.*")
+            nested_pattern = os.path.join(root, "files", "**", f"{md5_value}.*")
             candidates.extend(glob.glob(pattern))
+            candidates.extend(glob.glob(nested_pattern, recursive=True))
         existing = [path for path in candidates if os.path.isfile(path)]
         if not existing:
             return ""
-        existing.sort(key=lambda path: os.path.getsize(path), reverse=True)
+        existing.sort(key=lambda path: (os.path.getmtime(path), os.path.getsize(path)), reverse=True)
         return existing[0]
 
     def _append_quote_context(self, prompt: str, quote: dict) -> str:
@@ -4190,16 +5045,18 @@ class ClawPlugin(PluginBase):
             local_path = resource_path if (resource_path and os.path.isfile(resource_path)) else ""
             if not local_path and md5_value:
                 local_path = self._find_existing_file_path(md5_value=md5_value)
-            public_url = self._build_public_media_url(local_path, md5_value=md5_value) if md5_value or local_path else ""
             parts = ["[图片]"]
             if md5_value:
                 parts.append(f"md5={md5_value}")
-            if public_url:
-                parts.append(f"url={public_url}")
             cdn_key = _safe_text(quote.get("cdnthumbaeskey")).strip()
             if cdn_key:
                 parts.append(f"cdnthumbaeskey={cdn_key}")
             quoted_content = " ".join(parts).strip()
+            media_directive = self._build_gateway_media_directive(
+                gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
+            )
+            if media_directive:
+                quoted_content = f"{quoted_content}\n{media_directive}"
         elif quoted_type in {34, 43, 62}:
             quote_xml = _safe_text(quote.get("Content"))
             md5_value = self._extract_md5_from_media_xml(quote_xml)
@@ -4209,15 +5066,15 @@ class ClawPlugin(PluginBase):
                 local_path = self._find_existing_file_path(md5_value=md5_value)
 
             media_label = "语音" if quoted_type == 34 else "视频"
-            public_url = ""
-            if local_path:
-                public_url = self._build_public_media_url(local_path)
             parts = [f"[{media_label}]"]
             if md5_value:
                 parts.append(f"md5={md5_value}")
-            if public_url:
-                parts.append(f"url={public_url}")
             quoted_content = " ".join(parts).strip()
+            media_directive = self._build_gateway_media_directive(
+                gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
+            )
+            if media_directive:
+                quoted_content = f"{quoted_content}\n{media_directive}"
         elif quoted_type == 49:
             title = _safe_text(quote.get("title") or quote.get("Content")).strip()
             url = _safe_text(quote.get("url")).strip()
@@ -4279,20 +5136,17 @@ class ClawPlugin(PluginBase):
                     guessed_name = f"{md5_value}.{fileext}"
                 safe_title = os.path.basename(title) if title else ""
                 local_path = self._find_existing_file_path(md5_value=md5_value, file_name=safe_title)
-                public_url = ""
-                if local_path:
-                    public_url = self._build_public_media_url(local_path)
-                elif guessed_name:
-                    public_url = self._build_public_media_url("", file_name=guessed_name)
-
                 parts = ["[文件]"]
                 if safe_title:
                     parts.append(safe_title)
                 if md5_value:
                     parts.append(f"md5={md5_value}")
-                if public_url:
-                    parts.append(f"url={public_url}")
                 quoted_content = " ".join(parts).strip()
+                media_directive = self._build_gateway_media_directive(
+                    gateway_path=self._map_path_for_gateway(local_path) if local_path else "",
+                )
+                if media_directive:
+                    quoted_content = f"{quoted_content}\n{media_directive}"
             else:
                 desc = _safe_text(quote.get("destination")).strip()
                 thumb = _safe_text(quote.get("thumburl")).strip()
@@ -4325,50 +5179,6 @@ class ClawPlugin(PluginBase):
             lines.append(f"- 内容: {quoted_content}")
         return "\n".join(lines).strip()
 
-    def _extract_command_payload(self, content: str) -> Optional[str]:
-        if not content:
-            return None
-        candidates = [content.strip()]
-        parts = content.strip().split(maxsplit=1)
-        if parts and parts[0].startswith("@") and len(parts) > 1:
-            candidates.append(parts[1].strip())
-
-        for candidate in candidates:
-            lower_candidate = candidate.lower()
-            for command_key in self.command_keys:
-                if lower_candidate == command_key:
-                    return ""
-                if lower_candidate.startswith(f"{command_key} "):
-                    return candidate[len(command_key) :].strip()
-        return None
-
-    def _parse_json_arg(self, raw_json: str) -> dict:
-        try:
-            parsed = json.loads(raw_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"JSON 参数解析失败: {exc}") from exc
-        if parsed is None:
-            return {}
-        if not isinstance(parsed, dict):
-            raise ValueError("JSON 参数必须是对象，例如: {\"limit\":10}")
-        return parsed
-
-    def _format_status(self) -> str:
-        status = self.gateway.status_snapshot()
-        return (
-            "Claw 状态\n"
-            f"- 已启用: {self.enable}\n"
-            f"- 已连接: {status['connected']}\n"
-            f"- 地址: {status['ws_url']}\n"
-            f"- 协议: {status['protocol']}\n"
-            f"- 默认Agent: {status.get('default_agent_id') or '-'}\n"
-            f"- 方法数: {status['methods_count']}\n"
-            f"- 事件数: {status['events_count']}\n"
-            f"- Watch路由: {len(self._watch_routes)}\n"
-            f"- 最近事件: {status['last_event']}\n"
-            f"- 最近错误: {status['last_error'] or '无'}"
-        )
-
     def _resolve_agent_id(self) -> str:
         configured = (self.trigger_agent_id or self.default_agent_id).strip()
         if configured:
@@ -4376,21 +5186,6 @@ class ClawPlugin(PluginBase):
         if self.trigger_auto_default_agent:
             return self.gateway.default_agent_id().strip()
         return ""
-
-    def _help_text(self) -> str:
-        return (
-            "Claw 命令：\n"
-            "/claw status\n"
-            "/claw connect | /claw disconnect\n"
-            "/claw methods | /claw events\n"
-            "/claw watch on|off|list|clear\n"
-            "/claw call <method> [json]\n"
-            "/claw callf <method> [json]  (等待最终态)\n"
-            "/claw send <to>::<message>\n"
-            "/claw chat <to>::<message>\n"
-            "/claw agent <prompt>\n"
-            "/claw last"
-        )
 
     def _split_reply_chunks(self, content: str) -> list[str]:
         text = _safe_text(content)
