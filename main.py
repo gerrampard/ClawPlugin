@@ -1,6 +1,6 @@
 """
 @input: websockets、asyncio、tomllib、WechatAPIClient、PluginBase 与装饰器；base64/xml 解析用于图片/链接文章与引用上下文；OpenClaw 斜杠命令直通与方法速查；微信路由信息到 OpenClaw `to/groupId/accountId/sessionKey` 的结构化透传，以及通过 `channels.status` 发现网关当前真实支持的消息渠道
-@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/语音/视频/文件/引用消息转发；向网关透传会话/发送者标识；`sessionKey` 保持微信桥接所需的 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态，并仅在渠道已被当前 OpenClaw 版本识别时附带 `agent.channel/replyChannel`；握手时默认声明 `tool-events` 能力以接收实时工具事件；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；自动触发链路里的本地等待超时只记日志、不再向微信误报“模型超时”；流式回写后终态会在事件文本、累计流文本和 chat.history 完整文本之间选取可覆盖已发送前缀的最长版本，只补发未发送尾段，不再整段重复回写；图片相关 prompt/引用里的 `MEDIA:` 指令优先使用公网 URL，不再把宿主机本地路径暴露给网关；管理员 slash 中“真实网关方法”走 RPC，“OpenClaw 原生命令”走 `agent` 并复用当前 sessionKey；当未配置固定 `to-wxids` 时，仅把带 `runId/sessionKey` 的网关事件回推到对应微信会话；唤醒词帮助在本地列出常用命令与功能；当前消息图片和可解析的引用图片都会走网关原生 WS `attachments`，语音/视频/文件仅拼公网 `http://...` 链接；文件元数据可从 `appmsg type=6` XML 兜底提取；发往网关前会记录结构化请求摘要用于核对最终 `message/attachments`
+@output: ClawPlugin，提供 OpenClaw Gateway WebSocket 连接、RPC 调用与文本/AT/图片/语音/视频/文件/引用消息转发；向网关透传会话/发送者标识；`sessionKey` 保持微信桥接所需的 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态，并仅在渠道已被当前 OpenClaw 版本识别时附带 `agent.channel/replyChannel`；握手时默认声明 `tool-events` 能力以接收实时工具事件；支持后台触发不阻塞插件链路、同会话 pending-run 防堆积、WS 事件回推并默认仅终态回写完整回复（可选开启流式增量回写），并用 agent.wait + chat.history 兜底终态拉取；自动触发链路里的本地等待超时只记日志、不再向微信误报“模型超时”；流式回写后终态会在事件文本、累计流文本和 chat.history 完整文本之间选取可覆盖已发送前缀的最长版本，终态事件到来时也会主动对一次 history 取更长版本，并校验 history 已推进到当前用户消息再采用，只补发未发送尾段，不再整段重复回写；图片相关 prompt/引用里的 `MEDIA:` 指令优先使用公网 URL，不再把宿主机本地路径暴露给网关；管理员 slash 中“真实网关方法”走 RPC，“OpenClaw 原生命令”走 `agent` 并复用当前 sessionKey；当未配置固定 `to-wxids` 时，仅把带 `runId/sessionKey` 的网关事件回推到对应微信会话；唤醒词帮助在本地列出常用命令与功能；当前消息图片和可解析的引用图片都会走网关原生 WS `attachments`，语音/视频/文件仅拼公网 `http://...` 链接；文件元数据可从 `appmsg type=6` XML 兜底提取，并在缺少内存 payload 时优先用 `attach_id` 主动下载后落盘；发往网关前会记录结构化请求摘要，并对文件主动下载、媒体落盘与复用路径输出明确日志用于核对最终 `message/attachments`
 @position: plugins/Claw 的核心实现文件，负责消息路由、OpenClaw 会话命名、媒体附件/提示词封装、入站媒体落盘、文件 XML 元数据兜底与网关通信编排
 @auto-doc: Update header and folder INDEX.md when this file changes
 """
@@ -1405,7 +1405,7 @@ class ClawPlugin(PluginBase):
                 await self._ensure_image_base64(bot, message)
             attachments, attachment_meta = self._build_gateway_attachments(message)
             if not attachments:
-                await self._ensure_media_local_path(message)
+                await self._ensure_media_local_path(bot, message)
                 attachments, attachment_meta = self._build_gateway_attachments(message)
 
             prompt_text = self._strip_trigger_prompt(user_text, match_word)
@@ -2835,12 +2835,32 @@ class ClawPlugin(PluginBase):
 
         return "\n".join([p for p in parts if p]).strip()
 
-    def _extract_assistant_reply_from_chat_history(self, payload: Any) -> str:
-        if not isinstance(payload, dict):
+    def _extract_expected_history_user_marker(self, run_id: str) -> str:
+        meta = self._pending_run_meta.get(run_id) or {}
+        request_params = meta.get("requestParams")
+        if not isinstance(request_params, dict):
             return ""
+
+        request_message = _safe_text(request_params.get("message")).strip()
+        if not request_message:
+            return ""
+
+        msg_id_match = re.search(r"^- msg_id:\s*([^\n]+)", request_message, flags=re.MULTILINE)
+        if msg_id_match:
+            return f"- msg_id: {msg_id_match.group(1).strip()}"
+        return request_message[:160]
+
+    def _extract_assistant_reply_from_chat_history(
+        self,
+        payload: Any,
+        *,
+        expected_user_marker: str = "",
+    ) -> tuple[str, bool]:
+        if not isinstance(payload, dict):
+            return "", not bool(_safe_text(expected_user_marker).strip())
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
-            return ""
+            return "", not bool(_safe_text(expected_user_marker).strip())
 
         assistant_roles = {"assistant", "bot"}
         user_roles = {"user", "human"}
@@ -2860,7 +2880,17 @@ class ClawPlugin(PluginBase):
             last_user_index = fallback_boundary_index
 
         if last_user_index < 0:
-            return ""
+            return "", not bool(_safe_text(expected_user_marker).strip())
+
+        marker = _safe_text(expected_user_marker).strip()
+        latest_user_text = ""
+        if 0 <= last_user_index < len(messages):
+            latest_user_text = self._extract_text_from_chat_history_message(messages[last_user_index])
+        user_turn_matched = True
+        if marker:
+            user_turn_matched = marker in latest_user_text
+            if not user_turn_matched:
+                return "", False
 
         start = last_user_index + 1
         parts: list[str] = []
@@ -2874,12 +2904,17 @@ class ClawPlugin(PluginBase):
             if text:
                 parts.append(text)
 
-        return "\n".join(parts).strip()
+        return "\n".join(parts).strip(), user_turn_matched
 
-    async def _fetch_assistant_reply_via_chat_history(self, session_key: str) -> str:
+    async def _fetch_assistant_reply_via_chat_history(
+        self,
+        session_key: str,
+        *,
+        expected_user_marker: str = "",
+    ) -> tuple[str, bool]:
         session_key = _safe_text(session_key).strip()
         if not session_key:
-            return ""
+            return "", not bool(_safe_text(expected_user_marker).strip())
         try:
             payload = await self.gateway.request(
                 method="chat.history",
@@ -2889,8 +2924,11 @@ class ClawPlugin(PluginBase):
             )
         except Exception as exc:
             logger.warning("[Claw] chat.history 获取失败 sessionKey={} error={}", session_key, exc)
-            return ""
-        return self._extract_assistant_reply_from_chat_history(payload).strip()
+            return "", not bool(_safe_text(expected_user_marker).strip())
+        return self._extract_assistant_reply_from_chat_history(
+            payload,
+            expected_user_marker=expected_user_marker,
+        )
 
     def _pick_longest_reply_text(self, *texts: Any) -> str:
         best = ""
@@ -2907,11 +2945,13 @@ class ClawPlugin(PluginBase):
         session_key: str,
         *,
         prefer_history: bool = False,
+        require_current_history_turn: bool = False,
     ) -> str:
         pending_text = _safe_text(self._pending_run_texts.get(run_id, "")).strip()
         payload_text = self._extract_openclaw_reply_text(payload).strip()
         sent_text = _safe_text(self._pending_run_stream_sent_texts.get(run_id, "")).strip()
         best = self._pick_longest_reply_text(payload_text, pending_text)
+        expected_user_marker = self._extract_expected_history_user_marker(run_id)
 
         should_fetch_history = bool(session_key) and (
             prefer_history
@@ -2920,11 +2960,31 @@ class ClawPlugin(PluginBase):
             or (sent_text and best and not best.startswith(sent_text))
         )
         if should_fetch_history:
-            history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
+            history_text, history_turn_matched = await self._fetch_assistant_reply_via_chat_history(
+                session_key,
+                expected_user_marker=(expected_user_marker if require_current_history_turn else ""),
+            )
+            if require_current_history_turn and expected_user_marker and not history_turn_matched:
+                logger.info(
+                    "[Claw] chat.history 尚未推进到当前用户消息，继续等待 run_id={} marker={}",
+                    run_id,
+                    expected_user_marker,
+                )
+                return ""
             best = self._pick_longest_reply_text(best, history_text)
             if not best:
                 await asyncio.sleep(0.6)
-                history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
+                history_text, history_turn_matched = await self._fetch_assistant_reply_via_chat_history(
+                    session_key,
+                    expected_user_marker=(expected_user_marker if require_current_history_turn else ""),
+                )
+                if require_current_history_turn and expected_user_marker and not history_turn_matched:
+                    logger.info(
+                        "[Claw] chat.history 二次查询仍未推进到当前用户消息 run_id={} marker={}",
+                        run_id,
+                        expected_user_marker,
+                    )
+                    return ""
                 best = self._pick_longest_reply_text(best, history_text)
 
         return best
@@ -2940,7 +3000,12 @@ class ClawPlugin(PluginBase):
     ) -> bool:
         if run_id not in self._pending_run_routes:
             return True
-        history_text = await self._fetch_assistant_reply_via_chat_history(session_key)
+        history_text, history_turn_matched = await self._fetch_assistant_reply_via_chat_history(
+            session_key,
+            expected_user_marker=self._extract_expected_history_user_marker(run_id),
+        )
+        if not history_turn_matched:
+            return False
         if not history_text or len(history_text) < int(min_chars):
             return False
         logger.info("[Claw] 通过 chat.history 收敛终态 run_id={} reason={}", run_id, reason)
@@ -2987,11 +3052,14 @@ class ClawPlugin(PluginBase):
                 if not self._is_run_completion_event(event_name, payload):
                     return
 
+                # 终态事件的 payload 可能只带首段文本；这里始终结合 chat.history 取更长版本，
+                # 避免“事件先到、完整历史稍后落库”时被半截正文提前 finalize。
                 reply_text = await self._resolve_best_final_reply_text(
                     run_id,
                     payload,
                     session_key,
-                    prefer_history=bool(self._pending_run_stream_sent_texts.get(run_id, "").strip()),
+                    prefer_history=bool(session_key),
+                    require_current_history_turn=bool(session_key),
                 )
                 pending_text = self._pending_run_texts.get(run_id, "").strip()
                 reply_failure_kind = self._classify_model_failure_text(reply_text) if reply_text else ""
@@ -4849,13 +4917,26 @@ class ClawPlugin(PluginBase):
             return ""
         return f"MEDIA:{candidate}"
 
-    async def _ensure_media_local_path(self, message: dict) -> str:
+    async def _ensure_media_local_path(self, bot: WechatAPIClient, message: dict) -> str:
         local_path = self._resolve_media_local_path(message)
         if local_path:
+            logger.info(
+                "[Claw] 命中已存在媒体文件 msg_id={} msg_type={} path={}",
+                _safe_text(message.get("MsgId")).strip(),
+                int(message.get("MsgType") or 0),
+                local_path,
+            )
             return local_path
 
         payload = self._extract_inbound_media_payload(message)
         if not payload:
+            payload = await self._download_missing_media_payload(bot, message)
+        if not payload:
+            logger.warning(
+                "[Claw] 未获取到入站媒体 payload msg_id={} msg_type={}",
+                _safe_text(message.get("MsgId")).strip(),
+                int(message.get("MsgType") or 0),
+            )
             return ""
 
         file_path = self._persist_inbound_media_payload(message, payload)
@@ -4873,6 +4954,40 @@ class ClawPlugin(PluginBase):
         elif msg_type == 49:
             message["FilePath"] = file_path
         return file_path
+
+    async def _download_missing_media_payload(self, bot: WechatAPIClient, message: dict) -> bytes:
+        msg_type = int(message.get("MsgType") or 0)
+        if msg_type != 49:
+            return b""
+
+        file_meta = self._resolve_file_message_meta(message)
+        attach_id = _safe_text(file_meta.get("attach_id")).strip()
+        if not attach_id:
+            logger.warning(
+                "[Claw] 文件消息缺少 attach_id，无法主动下载 msg_id={} file_name={}",
+                _safe_text(message.get("MsgId")).strip(),
+                _safe_text(file_meta.get("file_name")).strip(),
+            )
+            return b""
+
+        logger.info(
+            "[Claw] 开始主动下载文件 attach_id={} msg_id={} file_name={}",
+            attach_id,
+            _safe_text(message.get("MsgId")).strip(),
+            _safe_text(file_meta.get("file_name")).strip(),
+        )
+        try:
+            payload_base64 = await bot.download_attach(attach_id)
+        except Exception as exc:
+            logger.warning("[Claw] 文件下载失败 attach_id={} error={}", attach_id, exc)
+            return b""
+
+        payload = self._coerce_media_payload_bytes(payload_base64)
+        if not payload:
+            logger.warning("[Claw] 文件下载结果为空或不可解析 attach_id={}", attach_id)
+            return b""
+        logger.info("[Claw] 文件下载成功 attach_id={} bytes={}", attach_id, len(payload))
+        return payload
 
     def _extract_inbound_media_payload(self, message: dict) -> bytes:
         msg_type = int(message.get("MsgType") or 0)
@@ -4932,6 +5047,20 @@ class ClawPlugin(PluginBase):
             if not os.path.isfile(file_path):
                 with open(file_path, "wb") as f:
                     f.write(payload)
+                logger.info(
+                    "[Claw] 媒体已落盘 msg_id={} msg_type={} bytes={} path={}",
+                    _safe_text(message.get("MsgId")).strip(),
+                    int(message.get("MsgType") or 0),
+                    len(payload),
+                    file_path,
+                )
+            else:
+                logger.info(
+                    "[Claw] 媒体文件已存在，复用落盘结果 msg_id={} msg_type={} path={}",
+                    _safe_text(message.get("MsgId")).strip(),
+                    int(message.get("MsgType") or 0),
+                    file_path,
+                )
             return file_path
         except Exception as exc:
             logger.warning("[Claw] 媒体落盘失败 path={} error={}", file_path, exc)
