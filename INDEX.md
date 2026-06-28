@@ -2,13 +2,33 @@
 
 # Claw
 
-OpenClaw 网关通信插件，负责网关 WS 连接、会话直通、slash 命令分流和事件回写。
+OpenClaw 网关通信插件（协议 v4），负责微信 <-> OpenClaw 网关的双向桥接。模块化拆分版。
+
+## Architecture
+
+```
+main.py (ClawPlugin) → 聚合入口，加载配置，实例化所有子模块
+├── gateway_client.py → OpenClawGatewayClient: WS 客户端、握手、RPC、事件分发、policy 解析
+├── trigger_handler.py → TriggerHandler: 消息触发器、路由构建、去重、管理员检测
+├── slash_commands.py → SlashCommandHandler: 斜杠命令解析执行、方法速查
+├── media_pipeline.py → MediaPipeline: 入站/出站媒体处理、附件构建、引用上下文
+├── session_manager.py → SessionManager: sessionKey 构建、OpenClaw agent context
+├── reply_writer.py → ReplyWriter: 回复分片/流式/终态收敛/pending run 生命周期
+└── event_handler.py → EventHandler: 网关事件分发、终态收敛、自动重试、事件转发
+```
 
 ## Files
 
-| File | Role | Function |
-|------|------|----------|
-| __init__.py | Entry | 导出 `ClawPlugin` 供插件管理器加载 |
-| main.py | Core | 实现 OpenClaw WS 客户端、触发词/私聊/AT 直通、slash 命令分流、图片/语音/视频/文件/引用/链接文章上下文附带、事件回写与 pending run 收敛；私聊 slash 可直接执行，群聊 slash 仅允许管理员在 `@机器人 + 唤醒词 + /命令` 格式下执行；真实网关方法继续按 RPC 调用，`/new`、`/reset`、`/model` 等 OpenClaw 原生命令改走 `agent` 并复用当前聊天对象的 `sessionKey`；当前会始终向 `agent` 透传 `to/groupId/accountId/sessionKey`，并在握手后通过 `channels.status` 缓存网关真实注册的渠道列表，仅在命中时才附带 `channel/replyChannel`，同时会话键保持 `agent:<agent>:<channel>:direct|group:<peer>` 规范形态；握手阶段会自动补齐 `tool-events` capability，避免网关把实时工具事件静默过滤；当前消息图片和可解析的引用图片都会封装为网关原生 WS `attachments`，同时写入 `content` 与 `source.base64` 两种附件内容表示，尽量兼容 Web UI / dashboard 上传格式；语音/视频/文件只会拼入公网 `http://...` 链接，不再回退本地路径或 `MEDIA:` 指令，图片相关 prompt/引用只有在无法构造成附件时才会退回公网 `MEDIA:` URL；在生成公网媒体 URL 前，插件会自动把 `files/claw-media/` 中的资源暴露到 `files/` 根目录，对齐现有 `/media/files/{filename}` 路由，避免资源 404；文件消息会额外从 `appmsg type=6` XML 兜底提取文件名/大小/扩展名/attach id，避免 prompt 退化成只剩用户文本；发往网关前会记录 `message/attachments/sessionKey/channel` 摘要日志，收到群 `@` 消息时还会额外记录 `Content/OriginalContent/PushContent/Ats/userText`，并优先在 `OriginalContent/TextContent/Content` 三个正文候选中做清洗和选择，只有三者都为空时才回退 `PushContent`，避免把“在群聊中@了你”这类提示文案误发给网关；插件自身不再对 `at_message` 做第二次 `@前缀` 剥离，避免和上游预处理重复裁剪；需要时会先把微信侧已下载的入站媒体 payload 落盘到 `files/claw-media/`；群回复会用真实发送者 wxid 生成 `AtWxIDList`，并优先使用接收消息自带的发送者昵称（如 `PushContent`/`SenderName`），过滤掉 wxid 形态的伪昵称后再显式拼接 `@昵称`；自动触发链路里的本地等待超时不再向微信回写“模型超时/网关超时”，只保留日志并继续等待真实终态；流式阶段已发出的正文会记录已发送前缀，终态会在事件文本、累计文本和 `chat.history` 之间选取可覆盖已发送前缀的最长版本，只补发未发送尾段，不再整段重复回写；原始网关事件体只会转发到显式配置的 `to-wxids`，不再按当前会话回推给微信用户；`龙虾 帮助/命令` 在本地返回常用命令说明；`chat` 无文本终态先等 `agent.wait/chat.history`，401/权限/账号停用等硬错误不再自动重试回打网关 |
-| config.toml | Config | 插件配置，覆盖网关连接鉴权、角色权限、能力声明（默认带 `tool-events`）、微信来源渠道标识（`gateway-channel` / `gateway-account-id`，其中 `gateway-channel` 仍用于稳定 `sessionKey`，插件会结合 `channels.status` 判断是否把该渠道写进 `agent.channel`）、唤醒词/私聊/AT 直通、管理员 slash 直通、稳定 `sessionKey`、图片转发、公网媒体地址、引用上下文、去重、pending run 看门狗和事件主动转发；`Claw.EventForward.to-wxids` 留空时不会向微信转发原始网关事件体 |
-| README.md | Doc | 当前可用能力、群聊 slash 约束、微信来源上下文透传策略、核心配置、事件转发边界和常用命令说明 |
+| File | Role | Lines | Function |
+|------|------|-------|----------|
+| `__init__.py` | Entry | 10 | 导出 ClawPlugin 供插件管理器加载 |
+| `main.py` | Orchestrator | ~750 | 插件入口，配置加载，子模块实例化，事件处理器路由，媒体回传/下载/分片等遗留逻辑 |
+| `gateway_client.py` | WS Client | 971 | OpenClawGatewayClient: WebSocket 连接管理、connect 握手、Ed25519 设备认证、RPC 请求/响应、事件分发、channels.status 探测、policy/server 信息、sessions/node/cron/tools/skills/usage 新方法支持 |
+| `trigger_handler.py` | Trigger | 514 | TriggerHandler: 消息去重、路由构建、触发词匹配、管理员检测、用户文本提取、pending run 管理，卡死 run 自动释放 |
+| `slash_commands.py` | Slash Cmd | 401 | SlashCommandHandler: 斜杠命令解析、网关 RPC 直通、OpenClaw 原生命令转发、方法速查描述 |
+| `media_pipeline.py` | Media | 812 | MediaPipeline: 入站媒体提取落盘、出站附件构建（base64/URL）、引用上下文提取、文件 XML 元数据解析、公网 URL 生成 |
+| `session_manager.py` | Session | 126 | SessionManager: sessionKey 构建解析、OpenClaw agent context 构建、会话路由映射、渠道解析 |
+| `reply_writer.py` | Reply | 1048 | ReplyWriter: 回复分片发送、agent/chat 分源流式累计与优先文本选择、终态收敛、终态后短暂保活补发、pending run 生命周期、模型错误分类与自动重试 |
+| `event_handler.py` | Events | 248 | EventHandler: 网关事件分发（agent/chat/health/shutdown/node.pair/device.pair/cron 等）、结束信号标记与单一路径延迟收敛、sessionKey 最新 run 选择、事件转发到 to-wxids |
+| `config.toml` | Config | 112 | 插件配置，覆盖网关连接鉴权、角色权限、能力声明、微信来源渠道标识、唤醒词/私聊/AT 直通、管理员 slash 直通、事件转发 |
+| `README.md` | Doc | 81 | 功能概览、核心配置、使用方式、行为说明 |

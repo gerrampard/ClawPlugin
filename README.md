@@ -2,15 +2,32 @@
 
 通过 OpenClaw Gateway WebSocket 把微信会话直通到网关，支持唤醒词对话、管理员 slash 命令、图片/语音/视频/文件/引用上下文和事件转发。
 
+**版本**: 1.2.0 | **协议**: v4 | **架构**: 模块化（7 个子模块）
+
+## 模块架构
+
+```
+main.py                    → 聚合入口（~750 行）
+├── gateway_client.py      → WS 客户端，988 行
+├── trigger_handler.py     → 触发器/路由，497 行
+├── slash_commands.py      → 斜杠命令，401 行
+├── media_pipeline.py      → 媒体处理，812 行
+├── session_manager.py     → 会话管理，126 行
+├── reply_writer.py        → 回复写入，963 行
+└── event_handler.py       → 事件处理，205 行
+```
+
 ## 功能概览
 
 - 自动完成 `connect.challenge -> connect -> hello-ok` 握手并保持 WS 连接
+- 新增 `sessions.*`/`node.*`/`cron.*`/`tools.*`/`skills.*`/`models.list`/`usage.*` 等新 RPC 方法支持
+- 新增 policy 常量解析（maxPayload/maxBufferedBytes/tickIntervalMs）
+- 新增新事件类型处理（presence/tick/heartbeat/session.message/sessions.changed/exec.approval/plugin.approval/voicewake.changed/shutdown/node.pair/device.pair/cron）
+- 管理员 slash 命令识别范围扩展至全部新 RPC 方法
+- `_describe_openclaw_method` 覆盖 80+ 方法的中文描述
 - 对话统一直通网关：唤醒词、私聊免唤醒词、群聊 `@机器人`
-- 管理员 slash 直通：私聊可直接发送 `/命令`；群聊需 `@机器人 + 唤醒词 + /命令`，真实网关 RPC method 走 RPC，`/new`、`/reset`、`/model`、`/think` 等 OpenClaw 原生命令走 `agent`
-- `龙虾 帮助` / `龙虾 命令` 本地返回常用命令和功能说明
 - 支持图片、语音、视频、文件、引用消息、链接文章上下文附带
-- 当前消息图片和可解析的引用图片优先走网关原生 WS `attachments`；语音、视频、文件改回走公网 `http://...` 链接提示，不再作为 WS 附件发送给网关
-- 支持 `Claw.EventForward` 事件主动转发；仅在显式配置 `to-wxids` 时转发原始网关事件体
+- 支持 `Claw.EventForward` 事件主动转发
 
 ## 核心配置
 
@@ -26,11 +43,8 @@
 - `at-auto-forward-enable`：群聊 `@机器人` 直通
 - `slash-command-forward-enable`：管理员 slash 直通
 - `default-agent-id`：固定使用指定 agent；留空时优先走网关默认 agent
-- `gateway-channel` / `gateway-account-id`：声明网关侧微信来源渠道；`sessionKey` 可保留 `wx-869`，插件握手成功后会通过 `channels.status` 读取网关当前实际注册的渠道列表，只有识别到该渠道时才附带 `agent.channel/replyChannel`
-- `trigger-use-session-key` / `trigger-session-prefix`：按聊天对象生成稳定 `sessionKey`；当前会输出 OpenClaw 可识别的 `agent:<agent>:<channel>:direct|group:<peer>`
+- `gateway-channel` / `gateway-account-id`：声明网关侧微信来源渠道
 - `stream-reply-enable`：是否回写流式增量；默认关闭，仅发送终态完整回复
-- `image-forward-mode` / `image-public-base-url`：图片摘要或公网链接传递方式；`image-public-base-url` 必须填写网关自己也能访问的地址，远端网关不要用 `127.0.0.1`
-- `pending-run-ttl-seconds` / `pending-run-watchdog-*`：pending run 清理和看门狗参数
 - `Claw.EventForward.to-wxids`：固定事件转发目标；留空时不向微信转发原始网关事件体
 
 ## 使用方式
@@ -43,38 +57,7 @@
 - 私聊 `/reset`：重置当前会话
 - 私聊 `/model`：查看或切换模型
 - 私聊 `/think <level>`：设置思考强度
-- 私聊 `/verbose <level>`：设置输出详细程度
-- 私聊 `/reasoning <level>`：设置推理强度
-- 私聊 `/compact`：压缩当前会话上下文
 - 私聊 `/status`：查看当前状态
 - 私聊 `/help`：查看 OpenClaw 内置帮助
 - 私聊 `/stop`：停止当前回复
 - 群聊管理员命令格式：`@机器人 龙虾 /new`
-
-## 行为说明
-
-- `agent` 请求始终透传 `to/groupId/accountId/sessionKey`；插件会在握手后调用 `channels.status` 缓存网关真实支持的渠道列表，只有命中该列表时才附带 `channel/replyChannel`，避免 `unknown channel` 直接被拒，同时允许自定义 `wechat` 渠道把渠道作用域工具正确挂进 agent 运行上下文
-- `sessionKey` 使用 OpenClaw 规范形态：私聊 `agent:<agent>:wx-869:direct:<wxid>`，群聊 `agent:<agent>:wx-869:group:<chatroom id>`
-- 默认只在终态回写完整文本，不回写流式 `delta`
-- 握手默认声明 `tool-events`，确保网关侧工具调用事件不会因为 `caps: []` 被静默过滤
-- 同一会话存在 pending run 时会跳过新的重复触发，避免队列堆积和多次回写
-- `accepted` 后会同时等待 WS 事件和 `agent.wait` 兜底，只回写一次终态；`chat` 完成事件如果暂时没有文本，会优先等待 `agent.wait/chat.history` 收敛，不会立刻回打网关重试
-- 自动触发入口如果只是本地等待 `agent` 首包超时，不会再直接给微信回“模型超时/网关超时”；插件会保留日志并继续等待后续 WS 事件或 `agent.wait/chat.history` 兜底终态
-- 开启流式回写时，插件会记录已发送前缀；终态会优先拿事件文本、累计流文本和 `chat.history` 中能覆盖该前缀的最长版本，再只补发还没发出去的尾段，避免既重复又丢后半段
-- 图片、语音、视频、文件、链接文章、引用消息会按当前会话上下文附带给网关；群聊通常需要触发词、`@机器人` 或引用触发
-- 图片消息和可解析的引用图片会优先发送网关原生 `attachments`，附件对象同时携带 `content` 和 `source: { type: "base64", media_type, data }` 两种 base64 表达，兼容 Web UI / dashboard 上传格式；只有引用图片无法构造成附件时，才会在引用上下文里退回公网 `MEDIA:` URL
-- 插件会在生成公网媒体 URL 前，自动把 `files/claw-media/` 中的文件暴露到 `files/` 根目录，确保现有 `/media/files/{filename}` 公共路由能直接命中，避免 voice/video/file 资源 URL 404
-- 语音/视频/文件只会在 prompt 中附带公网 `http://...` 链接；不会再向网关透传本地路径或 `MEDIA:` 指令；缺少现成本地路径时仍会复用微信框架已下载好的内存 payload 落盘到 `files/claw-media/`
-- 文件消息会优先从微信 `appmsg type=6` XML 里兜底提取文件名、大小、扩展名和 attach id，避免网关侧只收到用户文本而丢掉文件上下文
-- 每次发起 `agent` 请求前都会在插件日志记录请求摘要，包含最终 `message`、`attachments`、`sessionKey`、`channel/replyChannel`，可直接用来核对“发给网关为什么只剩 hi”
-- 群 `@机器人` 消息会额外记录 `Content`、`OriginalContent`、`PushContent`、`Ats` 和最终 `userText`；插件侧不再对 `at_message` 做第二次 `@前缀` 剥离，避免和上游 `@` 预处理重复裁剪
-- 群 `@机器人` 文本在提取正文时会优先清洗 `OriginalContent`、`TextContent`、`Content` 三个正文候选，只有三者都为空时才回退 `PushContent`，避免把“在群聊中@了你”这类提示文案误当成用户正文
-- 群聊中的 slash 文本不会直接发往网关；只有管理员同时满足 `@机器人 + 唤醒词 + /命令` 才会执行
-- 插件不会下载或回传网关附件；仅对微信侧已经拿到的非图片入站媒体 payload 做本地落盘，供网关读取
-- `401/未授权/权限不足/账号停用/配额不足` 一类硬错误不会自动重试，也不会再向网关发送 `[Gateway Retry Notice]`
-
-## 说明
-
-- slash 命令失败时不会退回成普通对话文本，避免把命令误发给模型
-- 如需转发原始网关事件体，显式设置 `Claw.EventForward.to-wxids`
-- 当前会话只接收正常对话回复，不再接收 `[ClawEvent] ...` 这类原始网关事件体

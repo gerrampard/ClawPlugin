@@ -72,7 +72,7 @@ trigger-agent-id = ""
 trigger-auto-default-agent = true
 trigger-reply-prefix = ""
 # 私聊消息无需触发词，直接转发
-private-auto-forward-enable = true
+private-auto-forward-enable = false
 # 管理员 slash 直通：
 # - 真正存在的网关 RPC method 继续走 RPC
 # - `/new` `/reset` `/model` 等 OpenClaw 原生命令走 `agent`
@@ -105,7 +105,8 @@ quote-include-enable = true
 [Claw.EventForward]
 # 事件主动转发（与对话直通独立）
 enable = true
-allowed-events = ["agent", "chat", "health", "shutdown", "node.pair.requested", "device.pair.requested"]
+# 支持的网关事件类型列表（新增: presence, tick, heartbeat, session.*, sessions.changed, exec.approval.*, plugin.approval.*, voicewake.changed, cron, node.pair.*, device.pair.*）
+allowed-events = ["agent", "chat", "health", "shutdown", "node.pair.requested", "device.pair.requested", "presence", "tick", "heartbeat", "session.message", "session.operation", "session.tool", "sessions.changed", "exec.approval.requested", "exec.approval.resolved", "plugin.approval.requested", "plugin.approval.resolved", "voicewake.changed", "cron", "node.pair.resolved", "device.pair.resolved"]
 # 固定事件转发目标；留空时不向微信转发原始网关事件体
 to-wxids = []
 mention-in-group = true
